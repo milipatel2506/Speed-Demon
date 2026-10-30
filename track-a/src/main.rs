@@ -170,6 +170,16 @@ fn main() {
         })
         .collect();
 
-    let text = render(0..HOURS, &names, &parts, &maps);
-    std::fs::write(format!("{out}/summary.txt"), text).unwrap();
+    // Each thread renders a run of consecutive hours, so the pieces concatenate in output order.
+    let (names, parts, maps) = (&names, &parts, &maps);
+    let pieces: Vec<Vec<u8>> = std::thread::scope(|s| {
+        let spawned: Vec<_> = (0..threads)
+            .map(|i| s.spawn(move || render(HOURS * i / threads..HOURS * (i + 1) / threads, names, parts, maps)))
+            .collect();
+        spawned.into_iter().map(|t| t.join().unwrap()).collect()
+    });
+    let mut file = File::create(format!("{out}/summary.txt")).unwrap();
+    for piece in pieces {
+        file.write_all(&piece).unwrap();
+    }
 }

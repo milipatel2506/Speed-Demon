@@ -15,6 +15,7 @@ Every step from the reference to your final version, each with the live-board ru
 | 5 | Opt 5b: `-C target-cpu=native` in `.cargo/config.toml`. Five A/B pairs against the generic build, native faster in all five (median 0.46 s vs 0.50 s on average). The board's own scan finds the flag, so this track is built on the scoring box, as the harness README says. The generic build is the fallback if that ever matters | | 0.46 | 53 | |
 | 6 | Opt 6: FxHash-style multiply-rotate hasher (`BuildHasherDefault<Fx>`, std only) in place of SipHash. Chosen from the phase table below. Interleaved 15 runs of each build: median 0.503 s to 0.453 s, min 0.433 s to 0.386 s | | 0.45 | 54 | |
 | 7 | Opt 7: new data layout. Endpoints interned in a 4096-slot open-addressing table per thread (Fx-style hash, names stored once); a group is (endpoint id, hour number) with flat per-thread arrays for 5xx counts and a counting sort of the latencies by group, so there is no per-group allocation and no `HashMap`; merging is just ranking the endpoint names once (sorted bytewise) and mapping each thread's ids to ranks, then output iterates hour by hour over the sorted names, so the 127k groups are never sorted. Interleaved 15 runs vs opt 6: median 0.466 s to 0.319 s, min 0.393 s to 0.264 s | | 0.32 | 49 | |
+| 8 | Opt 8: render the output in parallel. Each thread gathers, sorts and formats a run of consecutive hours, and the pieces are written in order. Interleaved 15 runs vs opt 7: median 0.325 s to 0.220 s, min 0.262 s to 0.181 s | | 0.22 | 49 | |
 
 Step 0 is the scoring box's calibration of the reference on seed 1. Steps 1 and later are measured on my dev machine (4 vCPU Xeon @ 2.1 GHz, warm page cache), not the scoring box, and have no board run ID yet, so replace them with the board's numbers. T is the median of 5 runs on `full`, and the same binary varies about 10% between sessions on this shared VM, so only compare rows measured back to back (seed 1) and M is the peak anonymous RSS, sampled from `/proc/<pid>/status` (RssAnon), which leaves out the file pages of the mapped input. Every row's output hash matched on tiny, sample and full. This machine has 4 CPUs, so the 12-thread step cannot show its full gain here.
 
@@ -49,6 +50,19 @@ Two sets, same drift caveat. The timers are in a scratchpad copy, not in the rep
 | Total | 483.5 | 505.5 | 326.3 | 316.4 |
 
 Opt 7 assumes the spec's fixed 72-hour span (every timestamp lies between 2026-10-30T18:00:00Z and 2026-11-02T17:59:59Z for every seed and scale, section 2 of the spec) and at most 4,095 distinct endpoints (the catalogue is 1,842).
+
+### After opt 8 (parallel render), full, median of 5 runs, ms
+
+| Phase | Opt 7, set 1 | Opt 7, set 2 | Opt 8, set 1 | Opt 8, set 2 |
+|---|---|---|---|---|
+| `mmap` call | 0.02 | 0.02 | 0.02 | 0.02 |
+| Parallel parse (scan, intern, counting sort) | 191.5 | 206.2 | 193.3 | 149.2 |
+| Rank endpoint names | 3.4 | 2.7 | 2.7 | 2.6 |
+| Percentile sort and formatting | 108.5 | 100.9 | 37.3 | 34.9 |
+| Write `summary.txt` | 7.0 | 6.8 | 6.8 | 5.8 |
+| Total | 326.3 | 316.4 | 245.1 | 193.2 |
+
+The render now runs on all 4 CPUs of this machine, so the 12 threads of the scoring box should shrink it further. The hours are cut into equal runs, so a thread with busier hours finishes last.
 
 Not tried: PGO. The system `llvm-profdata` is LLVM 18 but `rustc` here is LLVM 22, so the raw profile could not be merged, and a profile built here would not match the compiler in the allowlisted `halloumee/speed-demon-rust` image anyway. I could not pull that image because Docker Hub rate-limited the sandbox (HTTP 429). It needs a machine with that image, a committed `.profdata` generated inside it, and `-C profile-use` in the Dockerfile.
 
