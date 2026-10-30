@@ -18,6 +18,7 @@ Every step from the reference to your final version, each with the live-board ru
 | 8 | Opt 8: render the output in parallel. Each thread gathers, sorts and formats a run of consecutive hours, and the pieces are written in order. Interleaved 15 runs vs opt 7: median 0.325 s to 0.220 s, min 0.262 s to 0.181 s | | 0.22 | 49 | |
 | - | Failed experiment (opt 9): check whether this line's endpoint equals the previous line's before probing the intern table. Same hashes, no gain over opt 8 (median 0.225 s vs 0.235 s, mean 0.225 s both, 15 interleaved runs): consecutive lines rarely share an endpoint and the probe is already one hash and one compare. Reverted | | 0.24 | 55 | |
 | 9 | Safety, no speed goal: the program no longer assumes the 72-hour window, 4,095 endpoints or a final newline. The hour index is checked against the window (year included) and any line outside it makes the run redo the scan with the hours actually present (their first 13 bytes, which sort chronologically); the endpoint table doubles when half full; and the last chunk cut no longer lands inside an unterminated last line. Tested against the reference on a 576-hour file with 2025 and 2027 dates, a 5,000-endpoint file and a one-line file, all without a final newline, at 1 and 4 CPUs. The old binary panicked, hung and mis-cut on those. Interleaved 15 runs vs opt 8 on `full`: median 0.234 s to 0.246 s, mean 0.241 s to 0.238 s, which is noise | | 0.24 | 52 | |
+| 10 | Part 2 step 1: parse each line in one forward scan: jump past the fixed-width timestamp, skip the method, hash the endpoint byte by byte while finding its end, read the 5xx flag from the status's first digit, parse latency digits to the newline. No separate newline search or field split. Interleaved 15 runs vs row 9: median 0.206 s to 0.136 s, min 0.179 s to 0.119 s | | 0.14 | 58 | |
 
 Step 0 is the scoring box's calibration of the reference on seed 1. Steps 1 and later are measured on my dev machine (4 vCPU Xeon @ 2.1 GHz, warm page cache), not the scoring box, and have no board run ID yet, so replace them with the board's numbers. T is the median of 5 runs on `full`, and the same binary varies about 10% between sessions on this shared VM, so only compare rows measured back to back (seed 1) and M is the peak anonymous RSS, sampled from `/proc/<pid>/status` (RssAnon), which leaves out the file pages of the mapped input. Every row's output hash matched on tiny, sample and full. This machine has 4 CPUs, so the 12-thread step cannot show its full gain here.
 
@@ -79,6 +80,17 @@ The render now runs on all 4 CPUs of this machine, so the 12 threads of the scor
 | Total | 483.5 | 505.5 | 248.4 | 259.0 |
 
 Whole program, 15 interleaved runs, opt 6 binary against the final one: median 0.461 s to 0.252 s, min 0.378 s to 0.181 s. Peak anonymous memory about 44 to 56 MB. The parse is now about 80% of the run. `main.rs` is 195 code lines after rustfmt (it is committed already formatted; rustfmt widens long lines and small struct literals, so the raw count is 159).
+
+### Phase table across the parse work (full, median of 5 runs, ms)
+
+Temporary timers in a scratchpad copy, not in the repo; one set of 5 runs per row unless a label says otherwise, and this VM drifts by 10% or more between sets. Parse includes each thread's counting sort of its latencies.
+
+| Version | `mmap` | Parse | Rank names | Render | Write | Total |
+|---|---|---|---|---|---|---|
+| Before (Part 1 build), set 1 | 0.02 | 162.2 | 2.7 | 30.6 | 5.9 | 208.2 |
+| Before (Part 1 build), set 2 | 0.02 | 146.1 | 2.6 | 27.7 | 6.0 | 190.5 |
+| Part 2 step 1: single forward scan, set 1 | 0.02 | 86.7 | 2.6 | 24.6 | 5.5 | 118.7 |
+| Part 2 step 1: single forward scan, set 2 | 0.02 | 83.1 | 2.6 | 24.2 | 5.6 | 115.6 |
 
 Not tried: PGO. The system `llvm-profdata` is LLVM 18 but `rustc` here is LLVM 22, so the raw profile could not be merged, and a profile built here would not match the compiler in the allowlisted `halloumee/speed-demon-rust` image anyway. I could not pull that image because Docker Hub rate-limited the sandbox (HTTP 429). It needs a machine with that image, a committed `.profdata` generated inside it, and `-C profile-use` in the Dockerfile.
 

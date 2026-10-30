@@ -38,15 +38,13 @@ fn hour_label(hour: usize) -> String {
     format!("{}T{:02}:00:00Z", days[(hour + 18) / 24], (hour + 18) % 24)
 }
 
-// FxHash-style multiply-rotate hash of the bytes; the caller masks it down to a table slot.
+// FxHash-style multiply-rotate step; an endpoint's hash folds in its bytes one at a time.
+fn mix(h: u64, byte: u8) -> u64 {
+    (h.rotate_left(5) ^ byte as u64).wrapping_mul(0x517c_c1b7_2722_0a95)
+}
+
 fn hash(bytes: &[u8]) -> usize {
-    let mut h = 0u64;
-    for chunk in bytes.chunks(8) {
-        let mut word = [0; 8];
-        word[..chunk.len()].copy_from_slice(chunk);
-        h = (h.rotate_left(5) ^ u64::from_le_bytes(word)).wrapping_mul(0x517c_c1b7_2722_0a95);
-    }
-    (h >> 32) as usize
+    (bytes.iter().fold(0, |h, &b| mix(h, b)) >> 32) as usize
 }
 
 // One thread's share of the file. A group is (endpoint id, hour number), numbered id * hours + hour,
@@ -68,17 +66,31 @@ fn scan<'a>(
     let mut names: Vec<&[u8]> = Vec::new();
     let (mut start, mut errors) = (Vec::new(), Vec::new()); // `start` counts requests until the sort below
     let mut rows = Vec::new(); // (group, latency) for every line, in file order
-    for line in chunk.split(|&b| b == b'\n').filter(|l| !l.is_empty()) {
-        let mut f = line.split(|&b| b == b' ');
-        let ts = f.next().unwrap();
-        let endpoint = f.nth(1).unwrap();
-        let status = f.next().unwrap();
-        let latency = f
-            .next()
-            .unwrap()
-            .iter()
-            .fold(0u32, |n, &d| n * 10 + (d - b'0') as u32);
-        let mut slot = hash(endpoint) & (slots.len() - 1);
+    let mut i = 0;
+    while i < chunk.len() {
+        // One forward pass over the line: ts SP method SP endpoint SP status SP latency LF.
+        let ts = &chunk[i..i + 27];
+        i += 28;
+        while chunk[i] != b' ' {
+            i += 1;
+        }
+        let from = i + 1;
+        let mut h = 0;
+        i = from;
+        while chunk[i] != b' ' {
+            h = mix(h, chunk[i]);
+            i += 1;
+        }
+        let endpoint = &chunk[from..i];
+        let error = chunk[i + 1] == b'5';
+        i += 5;
+        let mut latency = 0u32;
+        while i < chunk.len() && chunk[i] != b'\n' {
+            latency = latency * 10 + (chunk[i] - b'0') as u32;
+            i += 1;
+        }
+        i += 1;
+        let mut slot = (h >> 32) as usize & (slots.len() - 1);
         let id = loop {
             match slots[slot] {
                 0 => {
@@ -105,7 +117,7 @@ fn scan<'a>(
         let group = id * hours + hour_of(ts)?;
         rows.push((group, latency));
         start[group] += 1;
-        errors[group] += (status[0] == b'5') as u32;
+        errors[group] += error as u32;
     }
     // Counting sort of the latencies by group: turn the counts into start offsets, then place.
     let mut sum = 0;
