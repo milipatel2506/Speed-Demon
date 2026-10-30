@@ -30,6 +30,13 @@ fn hour_index(ts: &[u8]) -> Option<usize> {
     (&ts[..4] == b"2026" && (0..HOURS as isize).contains(&hour)).then_some(hour as usize)
 }
 
+// The value of eight decimal digits held as digit values, first digit in the lowest byte.
+fn digits8(mut w: u64) -> u32 {
+    w = w * 10 + (w >> 8);
+    let (low, high) = (w & 0x0000_00ff_0000_00ff, (w >> 16) & 0x0000_00ff_0000_00ff);
+    ((low * 0x000f_4240_0000_0064 + high * 0x0000_2710_0000_0001) >> 32) as u32
+}
+
 // FxHash-style multiply-rotate hash, folding in the bytes 8 at a time (the last word zero-padded).
 fn fold(mut h: u64, bytes: &[u8]) -> u64 {
     for chunk in bytes.chunks(8) {
@@ -101,10 +108,23 @@ fn scan<'a>(
         let endpoint = &chunk[from..i];
         let error = chunk[i + 1] == b'5';
         i += 5;
+        // Up to seven digits and the newline fit in one 8-byte load: find the newline, shift the digits
+        // to the top of the word and convert them all at once. Longer latencies take the byte loop.
+        let word = chunk
+            .get(i..i + 8)
+            .map_or(0, |b| u64::from_le_bytes(b.try_into().unwrap()));
+        let x = word ^ 0x0a0a_0a0a_0a0a_0a0a;
+        let newline = x.wrapping_sub(0x0101_0101_0101_0101) & !x & 0x8080_8080_8080_8080;
         let mut latency = 0u32;
-        while i < chunk.len() && chunk[i] != b'\n' {
-            latency = latency * 10 + (chunk[i] - b'0') as u32;
-            i += 1;
+        if newline != 0 && chunk.len() >= i + 8 {
+            let digits = newline.trailing_zeros() as usize / 8;
+            latency = digits8((word << (64 - 8 * digits)) & 0x0f0f_0f0f_0f0f_0f0f);
+            i += digits;
+        } else {
+            while i < chunk.len() && chunk[i] != b'\n' {
+                latency = latency * 10 + (chunk[i] - b'0') as u32;
+                i += 1;
+            }
         }
         i += 1;
         let mut slot = (h >> 32) as usize & (slots.len() - 1);
