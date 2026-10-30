@@ -197,50 +197,6 @@ fn percentile(sorted: &[u32], p: usize) -> u32 {
     sorted[(p * sorted.len() + 99) / 100 - 1]
 }
 
-// The summary lines for a range of hours. `maps[t][rank]` is endpoint `rank` (in sorted order)
-// as thread t's local id, if thread t saw it.
-fn render(
-    hours: std::ops::Range<usize>,
-    labels: &[String],
-    names: &[&[u8]],
-    parts: &[Part],
-    maps: &[Vec<Option<usize>>],
-) -> Vec<u8> {
-    let (mut text, mut lat) = (Vec::new(), Vec::new());
-    for hour in hours {
-        for (rank, name) in names.iter().enumerate() {
-            lat.clear();
-            let mut errors = 0;
-            for (part, map) in parts.iter().zip(maps) {
-                if let Some(id) = map[rank] {
-                    let g = id * labels.len() + hour;
-                    lat.extend_from_slice(
-                        &part.lat[part.start[g] as usize..part.start[g + 1] as usize],
-                    );
-                    errors += part.errors[g] as u64;
-                }
-            }
-            if lat.is_empty() {
-                continue;
-            }
-            lat.sort_unstable();
-            let count = lat.len() as u64;
-            write!(text, "{} ", labels[hour]).unwrap();
-            text.extend_from_slice(name);
-            writeln!(
-                text,
-                " {count} {} {} {} {errors} {}",
-                percentile(&lat, 50),
-                percentile(&lat, 95),
-                percentile(&lat, 99),
-                errors * 1_000_000 / count
-            )
-            .unwrap();
-        }
-    }
-    text
-}
-
 fn main() {
     let mut args = std::env::args().skip(1);
     let data = args.next().unwrap_or_else(|| "/data".into());
@@ -249,16 +205,17 @@ fn main() {
 
     // Cut the file after a newline into one chunk per thread; each thread scans its own chunk.
     let threads = std::thread::available_parallelism().unwrap().get();
-    let mut cuts = vec![0];
-    for i in 1..threads {
-        let from = (input.len() * i / threads).max(cuts[i - 1]);
-        let line_end = input[from..]
-            .iter()
-            .position(|&b| b == b'\n')
-            .map_or(input.len() - from, |n| n + 1);
-        cuts.push(from + line_end);
-    }
-    cuts.push(input.len());
+    let cuts: Vec<usize> = (0..=threads)
+        .map(|i| {
+            let from = input.len() * i / threads;
+            let rest = input[from..].iter().position(|&b| b == b'\n');
+            if i == 0 {
+                0
+            } else {
+                from + rest.map_or(input.len() - from, |n| n + 1)
+            }
+        })
+        .collect();
 
     // Fast path: the spec's 72-hour window. If any timestamp is outside it, number the distinct hours
     // actually present (their first 13 bytes, which sort chronologically) and scan again.
@@ -294,20 +251,43 @@ fn main() {
 
     // Each thread renders a run of consecutive hours, so the pieces concatenate in output order.
     let hours = labels.len();
-    let (labels, names, parts, maps) = (&labels, &names, &parts, &maps);
+    let render = |range: std::ops::Range<usize>| {
+        let (mut text, mut lat) = (Vec::new(), Vec::new());
+        for hour in range {
+            for (rank, name) in names.iter().enumerate() {
+                lat.clear();
+                let mut errors = 0;
+                for (part, map) in parts.iter().zip(&maps) {
+                    if let Some(id) = map[rank] {
+                        let g = id * hours + hour;
+                        lat.extend_from_slice(
+                            &part.lat[part.start[g] as usize..part.start[g + 1] as usize],
+                        );
+                        errors += part.errors[g] as u64;
+                    }
+                }
+                if lat.is_empty() {
+                    continue;
+                }
+                lat.sort_unstable();
+                let count = lat.len() as u64;
+                write!(text, "{} ", labels[hour]).unwrap();
+                text.extend_from_slice(name);
+                let [p50, p95, p99] = [50, 95, 99].map(|p| percentile(&lat, p));
+                writeln!(
+                    text,
+                    " {count} {p50} {p95} {p99} {errors} {}",
+                    errors * 1_000_000 / count
+                )
+                .unwrap();
+            }
+        }
+        text
+    };
+    let render = &render;
     let pieces: Vec<Vec<u8>> = std::thread::scope(|s| {
         let spawned: Vec<_> = (0..threads)
-            .map(|i| {
-                s.spawn(move || {
-                    render(
-                        hours * i / threads..hours * (i + 1) / threads,
-                        labels,
-                        names,
-                        parts,
-                        maps,
-                    )
-                })
-            })
+            .map(|i| s.spawn(move || render(hours * i / threads..hours * (i + 1) / threads)))
             .collect();
         spawned.into_iter().map(|t| t.join().unwrap()).collect()
     });
