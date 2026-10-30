@@ -5,6 +5,7 @@ Every step from the reference to your final version, each with the live-board ru
 | Step | Change | Run ID | T (s) | M (MB) | Points |
 |---|---|---|---|---|---|
 | 0 | The reference, unchanged | | 32.05 | 228 | 0 |
-| 1 | Baseline: simple single-threaded Rust, `BTreeMap` of (hour, endpoint), std only | pending first board run | 4.4 (local container, not the box) | 270 (local peak RSS) | pending |
+| 1 | Baseline: simple single-threaded Rust, `BTreeMap` of (hour, endpoint), std only | | 1.90 | 268 | |
+| 2 | Opt 1: `mmap` the file via `extern "C"` (no crate), hand-written byte parser (hour = first 13 bytes, digits parsed directly) | | 1.39 | 40 | |
 
-Step 0 is the scoring box's calibration of the reference on seed 1. Step 1 was measured locally: the image was built offline and run with the board's limits (read-only root, 1 GB `/tmp`, uid 65534), full dataset, output hash matching the reference. The first run of the binary outside Docker took 8.8 s on a cold page cache. These are not the box's numbers, so replace them with the board run's.
+Step 0 is the scoring box's calibration of the reference on seed 1. Steps 1 and later are measured on my dev machine (4 vCPU Xeon @ 2.1 GHz, warm page cache), not the scoring box, and have no board run ID yet, so replace them with the board's numbers. T is the median of 5 runs on `full` (seed 1) and M is the peak anonymous RSS, sampled from `/proc/<pid>/status` (RssAnon), which leaves out the file pages of the mapped input. Every row's output hash matched on tiny, sample and full. This machine has 4 CPUs, so the 12-thread step cannot show its full gain here.
