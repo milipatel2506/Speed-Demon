@@ -63,6 +63,7 @@ fn scan<'a>(
     let mut names: Vec<&[u8]> = Vec::new();
     let (mut start, mut errors) = (Vec::new(), Vec::new()); // `start` counts requests until the sort below
     let mut rows: Vec<Vec<u64>> = Vec::new(); // group << 32 | latency per line, in blocks freed as the sort consumes them
+    let mut last = ([0u8; 13], 0); // the previous line's hour text and number
     let mut i = 0;
     while i < chunk.len() {
         // One forward pass over the line: ts SP method SP endpoint SP status SP latency LF.
@@ -130,7 +131,10 @@ fn scan<'a>(
                 _ => slot = (slot + 1) & (slots.len() - 1),
             }
         };
-        let group = id * hours + hour_of(ts)?;
+        if last.0 != ts[..13] {
+            last = (ts[..13].try_into().unwrap(), hour_of(ts)?);
+        }
+        let group = id * hours + last.1;
         if rows.last().map_or(true, |block| block.len() == BLOCK) {
             rows.push(Vec::with_capacity(BLOCK));
         }
