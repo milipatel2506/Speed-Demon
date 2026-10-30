@@ -4,7 +4,7 @@ The task, the input files and the exact output format are in the [spec](https://
 
 ## Approach
 
-A std-only Rust program. It memory-maps `requests.log` (a small `extern "C"` declaration of `mmap`, no crate), cuts the file after a newline into one chunk per available CPU, and each thread scans its chunk with a hand-written byte parser: the hour is the first 13 bytes of the timestamp, and latency and status are parsed from digits. Each thread keeps a `HashMap` (with a small FxHash-style hasher instead of SipHash) from (hour, endpoint bytes) to its latencies and 5xx count. The tables are merged, the groups are sorted once by (hour, endpoint) as bytes, and each group's latencies are sorted for the nearest-rank p50, p95 and p99 (`(p*n + 99) / 100`). `error_ppm` is `errors * 1_000_000 / count` in integers. Nothing relies on the input being sorted. Built with `-C target-cpu=native`. `PERF.md` has every step, including the experiments that did not help.
+A std-only Rust program. It memory-maps `requests.log` (a small `extern "C"` declaration of `mmap`, no crate), cuts the file after a newline into one chunk per available CPU, and each thread scans its chunk with a hand-written byte parser. A thread interns each endpoint into a 4096-slot open-addressing table (FxHash-style hash), so a group is a dense (endpoint id, hour number) pair. The hour number comes straight from the timestamp digits, using the spec's fixed 72-hour span. Per-thread flat arrays hold the request and 5xx counts, and the latencies are counting-sorted by group, so no per-group allocation exists. Merging is ranking the endpoint names once, bytewise, and mapping each thread's ids to ranks. The output is then rendered hour by hour over the sorted names, on all threads at once: for each group the threads' latency slices are gathered, sorted, and the nearest-rank p50, p95 and p99 (`(p*n + 99) / 100`) and `errors * 1_000_000 / count` are printed in integers. Nothing relies on the input being sorted. Built with `-C target-cpu=native`. `PERF.md` has every step, including the experiments that did not help.
 
 ## Dependencies
 
@@ -12,4 +12,4 @@ None. Standard library only.
 
 ## With another 24 hours
 
-Intern the 1,842 endpoints once so groups become a flat array indexed by hour and endpoint id, merge the thread tables in parallel, and try PGO with a profile generated inside the allowlisted llvm-tools image.
+Speed up the parse, which is now about 80% of the run (it splits and re-scans each line; a single pass over the bytes should be faster), and try PGO with a profile generated inside the allowlisted llvm-tools image.

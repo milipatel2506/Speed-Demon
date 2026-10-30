@@ -13,7 +13,12 @@ fn map(path: &str) -> &'static [u8] {
     if len == 0 {
         return &[];
     }
-    unsafe { std::slice::from_raw_parts(mmap(std::ptr::null_mut(), len, 1, 2, file.as_raw_fd(), 0), len) }
+    unsafe {
+        std::slice::from_raw_parts(
+            mmap(std::ptr::null_mut(), len, 1, 2, file.as_raw_fd(), 0),
+            len,
+        )
+    }
 }
 
 const HOURS: usize = 72; // every timestamp is in the 72 hours from 2026-10-30T18:00Z (spec, section 2)
@@ -59,7 +64,11 @@ fn scan(chunk: &[u8]) -> Part<'_> {
         let ts = f.next().unwrap();
         let endpoint = f.nth(1).unwrap();
         let status = f.next().unwrap();
-        let latency = f.next().unwrap().iter().fold(0u32, |n, &d| n * 10 + (d - b'0') as u32);
+        let latency = f
+            .next()
+            .unwrap()
+            .iter()
+            .fold(0u32, |n, &d| n * 10 + (d - b'0') as u32);
         let mut slot = slot_of(endpoint);
         let id = loop {
             match slots[slot] {
@@ -91,7 +100,12 @@ fn scan(chunk: &[u8]) -> Part<'_> {
         lat[next[group] as usize] = latency;
         next[group] += 1;
     }
-    Part { names, errors, start, lat }
+    Part {
+        names,
+        errors,
+        start,
+        lat,
+    }
 }
 
 // Nearest rank: the value at 1-indexed rank ceil(p * n / 100).
@@ -101,7 +115,12 @@ fn percentile(sorted: &[u32], p: usize) -> u32 {
 
 // The summary lines for a range of hours. `maps[t][rank]` is endpoint `rank` (in sorted order)
 // as thread t's local id, if thread t saw it.
-fn render(hours: std::ops::Range<usize>, names: &[&[u8]], parts: &[Part], maps: &[Vec<Option<usize>>]) -> Vec<u8> {
+fn render(
+    hours: std::ops::Range<usize>,
+    names: &[&[u8]],
+    parts: &[Part],
+    maps: &[Vec<Option<usize>>],
+) -> Vec<u8> {
     let (mut text, mut lat) = (Vec::new(), Vec::new());
     for hour in hours {
         for (rank, name) in names.iter().enumerate() {
@@ -110,7 +129,9 @@ fn render(hours: std::ops::Range<usize>, names: &[&[u8]], parts: &[Part], maps: 
             for (part, map) in parts.iter().zip(maps) {
                 if let Some(id) = map[rank] {
                     let g = id * HOURS + hour;
-                    lat.extend_from_slice(&part.lat[part.start[g] as usize..part.start[g + 1] as usize]);
+                    lat.extend_from_slice(
+                        &part.lat[part.start[g] as usize..part.start[g + 1] as usize],
+                    );
                     errors += part.errors[g] as u64;
                 }
             }
@@ -146,12 +167,18 @@ fn main() {
     let mut cuts = vec![0];
     for i in 1..threads {
         let from = (input.len() * i / threads).max(cuts[i - 1]);
-        let line_end = input[from..].iter().position(|&b| b == b'\n').map_or(0, |n| n + 1);
+        let line_end = input[from..]
+            .iter()
+            .position(|&b| b == b'\n')
+            .map_or(0, |n| n + 1);
         cuts.push(from + line_end);
     }
     cuts.push(input.len());
     let parts: Vec<Part> = std::thread::scope(|s| {
-        let spawned: Vec<_> = cuts.windows(2).map(|w| s.spawn(|| scan(&input[w[0]..w[1]]))).collect();
+        let spawned: Vec<_> = cuts
+            .windows(2)
+            .map(|w| s.spawn(|| scan(&input[w[0]..w[1]])))
+            .collect();
         spawned.into_iter().map(|t| t.join().unwrap()).collect()
     });
 
@@ -174,7 +201,16 @@ fn main() {
     let (names, parts, maps) = (&names, &parts, &maps);
     let pieces: Vec<Vec<u8>> = std::thread::scope(|s| {
         let spawned: Vec<_> = (0..threads)
-            .map(|i| s.spawn(move || render(HOURS * i / threads..HOURS * (i + 1) / threads, names, parts, maps)))
+            .map(|i| {
+                s.spawn(move || {
+                    render(
+                        HOURS * i / threads..HOURS * (i + 1) / threads,
+                        names,
+                        parts,
+                        maps,
+                    )
+                })
+            })
             .collect();
         spawned.into_iter().map(|t| t.join().unwrap()).collect()
     });
