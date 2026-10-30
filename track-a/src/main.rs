@@ -309,17 +309,17 @@ fn main() {
                 text.push(b'\n');
             }
         }
-        hour_text.concat()
+        hour_text
     };
     let render = &render;
-    let pieces: Vec<Vec<u8>> = std::thread::scope(|s| {
+    let pieces: Vec<Vec<Vec<u8>>> = std::thread::scope(|s| {
         let spawned: Vec<_> = (0..threads)
             .map(|i| s.spawn(move || render(hours * i / threads..hours * (i + 1) / threads)))
             .collect();
         spawned.into_iter().map(|t| t.join().unwrap()).collect()
     });
     let mut file = File::create(format!("{out}/summary.txt")).unwrap();
-    for piece in pieces {
-        file.write_all(&piece).unwrap();
+    for piece in pieces.iter().flatten() {
+        file.write_all(piece).unwrap();
     }
 }
