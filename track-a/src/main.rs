@@ -275,9 +275,11 @@ fn main() {
     // Each thread renders a run of consecutive hours, so the pieces concatenate in output order.
     let hours = labels.len();
     let render = |range: std::ops::Range<usize>| {
-        let (mut text, mut lat) = (Vec::new(), Vec::new());
-        for hour in range {
-            for (rank, name) in names.iter().enumerate() {
+        // Endpoint by endpoint, so each part's counts are read in order; one buffer per hour keeps the output order.
+        let (mut hour_text, mut lat) = (vec![Vec::new(); range.len()], Vec::new());
+        for (rank, name) in names.iter().enumerate() {
+            for hour in range.clone() {
+                let text = &mut hour_text[hour - range.start];
                 lat.clear();
                 let mut errors = 0;
                 for (part, map) in parts.iter().zip(&maps) {
@@ -302,12 +304,12 @@ fn main() {
                     [50, 95, 99].map(|p| lat[(p * lat.len() + 99) / 100 - 1] as u64);
                 for n in [count, p50, p95, p99, errors, errors * 1_000_000 / count] {
                     text.push(b' ');
-                    push_decimal(&mut text, n);
+                    push_decimal(text, n);
                 }
                 text.push(b'\n');
             }
         }
-        text
+        hour_text.concat()
     };
     let render = &render;
     let pieces: Vec<Vec<u8>> = std::thread::scope(|s| {
