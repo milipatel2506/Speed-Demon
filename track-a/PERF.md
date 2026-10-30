@@ -151,6 +151,31 @@ Measured to check that the fixed costs are small; no code changed.
 
 Spawning, start-up and the merge cost well under 1% of the run between them. The counting sort is about 9% of each scan thread, but it is real work (3.1M scattered writes), not overhead.
 
+### Stage 1: where the time goes, layer by layer (full, seed 1, 4 threads)
+
+Cumulative ablation builds of the current source (scratchpad only, outputs deliberately wrong), each stopping after one more layer. "Level" is the median time of the scan phase (`scan_all`, ms); "step" is the median of the per-round difference to the previous layer over 41 interleaved rounds, which cancels the drift of this shared VM. Single medians of two separate sessions disagreed by up to 15 ms per layer, so read each step with its spread.
+
+| Layer (cumulative) | Level, ms | Step, ms | Step spread (p25 to p75) | Minor page faults added |
+|---|---|---|---|---|
+| Input streaming only (count newlines over the mapping) | 17.0 | 17.0 | 16.0 to 18.4 | 3,523 |
+| + field extraction: delimiters, endpoint hash, digits, hour number | 47.9 | 30.1 | 22.9 to 32.8 | about 0 |
+| + intern lookup (open-addressing probe, name compare) | 57.3 | 10.3 | 6.8 to 13.2 | 1,257 |
+| + count and error updates (`start[g] += 1`, `errors[g] += e`) | 57.3 | 3.8 | -1.3 to 6.2 | 2 |
+| + `u64` row push (64K-entry blocks) | 70.1 | 9.4 | 5.1 to 15.0 | 6,076 |
+| + counting sort | 74.7 | 6.1 | -1.7 to 15.0 | 3,052 |
+
+Outside the scan, for the whole program (phase timers, two sets, ms): mmap call 0.01, rank endpoint names 2.7 to 2.8, render 23.2 and 27.9, write 6.4 and 6.1, total 111.8 and 125.4.
+
+What the ladder says:
+
+- Streaming plus field extraction is about 47 ms of the roughly 75 ms scan: it is the largest cost and the one that scales with the input size. The AVX2 experiment (rows above) moved only the delimiter part of it and got nothing.
+- The random count and error updates cost about 4 ms (at most 6) and the whole counting sort about 6 ms (the single measurements range from 4.6 to 12). Together that is roughly 10 ms of a 110 ms run, which is the most a radix sort could ever remove, and a radix sort adds its own two passes over 25 MB plus a second 25 MB buffer (more page faults), so it is unlikely to win.
+- The row push costs about 7 ms when rows are leaked instead of freed (9.4 ms paired step; 7.1 ms with rows leaked), so freeing them is only about 2 ms. Pushing into a flat, pre-faulted buffer made the line loop itself free (60.2 ms against 60.8 ms for the counts-only layer), so the row cost is page faults and block allocation (6,076 faults), not stores.
+- Render is the second largest phase at about 23 to 28 ms (gather, sort of each small group, formatting), then the write at about 6 ms.
+- Page faults are a visible cost on this VM: 3.5k for the input mapping and 10.4k for the row and latency buffers, at an estimated 1 to 2 microseconds each.
+
+Verification pipeline for the stages that follow: the three seed-1 hashes, seeds 2, 3 and 4 at full scale (reference hashes in the scratchpad), the spec example, empty input, the three stress files plus the one-line file at 1 and 4 CPUs, and the board's own `run_submission.py` gates; all pass on the current build.
+
 Not tried: PGO. The system `llvm-profdata` is LLVM 18 but `rustc` here is LLVM 22, so the raw profile could not be merged, and a profile built here would not match the compiler in the allowlisted `halloumee/speed-demon-rust` image anyway. I could not pull that image because Docker Hub rate-limited the sandbox (HTTP 429). It needs a machine with that image, a committed `.profdata` generated inside it, and `-C profile-use` in the Dockerfile.
 
 Final check of the finished code: the image built offline with `--network=none` and ran under the board's limits (read-only root, 1 GB `/tmp`, uid 65534, `/data` read-only, 4 CPUs). `/out` held only `summary.txt`, and all three hashes matched. Full took 0.98 s wall including `docker run` start-up (about 0.5 s of that is Docker, not the program). The box has 12 threads, so expect the threaded scan to do better there than on this 4-CPU machine.
