@@ -1,11 +1,25 @@
 use std::collections::BTreeSet;
 use std::fs::File;
 use std::io::Write;
-use std::os::unix::fs::FileExt;
+use std::os::fd::AsRawFd;
+use std::ptr::null_mut;
+
+extern "C" {
+    fn mmap(addr: *mut u8, len: usize, prot: i32, flags: i32, fd: i32, off: i64) -> *mut u8;
+}
+
+// Map the file read-only (PROT_READ, MAP_PRIVATE) instead of reading it onto the heap.
+fn map(path: &str) -> &'static [u8] {
+    let file = File::open(path).unwrap();
+    let len = file.metadata().unwrap().len() as usize;
+    if len == 0 {
+        return &[];
+    }
+    unsafe { std::slice::from_raw_parts(mmap(null_mut(), len, 1, 2, file.as_raw_fd(), 0), len) }
+}
 
 const HOURS: usize = 72;
 const BLOCK: usize = 1 << 16;
-const READ: usize = 64 << 10; // bytes per pread
 
 // Hour number 0..72 of a timestamp in the 72 hours from 2026-10-30T18:00Z that the spec promises,
 // or None for any other timestamp.
@@ -32,118 +46,99 @@ fn mix(h: u64, word: u64) -> u64 {
 
 // One thread's share of the file. A group is (endpoint id, hour number), numbered id * hours + hour,
 // with ids dense in order of first appearance. `lat[start[g]..start[g + 1]]` holds group g's latencies.
-struct Part {
-    names: Vec<Vec<u8>>,
+struct Part<'a> {
+    names: Vec<&'a [u8]>,
     errors: Vec<u32>,
     start: Vec<u32>,
     lat: Vec<u32>,
 }
 
-// Scan a byte range of the file (whole lines), reading it in blocks of READ bytes. `hour_of` numbers a
-// timestamp's hour in 0..hours; None abandons the scan.
-fn scan(
-    file: &File,
-    range: std::ops::Range<usize>,
+// Scan one chunk. `hour_of` numbers a timestamp's hour in 0..hours; None abandons the scan.
+fn scan<'a>(
+    chunk: &'a [u8],
     hours: usize,
     hour_of: &impl Fn(&[u8]) -> Option<usize>,
-) -> Option<Part> {
+) -> Option<Part<'a>> {
     let mut slots = vec![0u32; 4096]; // endpoint id + 1, or 0 for an empty slot; doubles when half full
-    let mut names: Vec<Vec<u8>> = Vec::new();
+    let mut names: Vec<&[u8]> = Vec::new();
     let (mut start, mut errors) = (Vec::new(), Vec::new()); // `start` counts requests until the sort below
     let mut rows: Vec<Vec<u64>> = Vec::new(); // group << 32 | latency per line, in blocks freed as the sort consumes them
-    let (mut pos, mut carry, mut buf) = (range.start, 0, vec![0; READ]);
-    while pos < range.end || carry > 0 {
-        // Fill the buffer after the partial line carried over, then scan up to the last whole line.
-        let n = (READ - carry).min(range.end - pos);
-        file.read_exact_at(&mut buf[carry..carry + n], pos as u64)
-            .unwrap();
-        pos += n;
-        let filled = carry + n;
-        let end = if pos == range.end {
-            filled
-        } else {
-            buf[..filled].iter().rposition(|&b| b == b'\n').unwrap() + 1
-        };
-        let chunk = &buf[..end];
-        let mut i = 0;
-        while i < chunk.len() {
-            // One forward pass over the line: ts SP method SP endpoint SP status SP latency LF.
-            let ts = &chunk[i..i + 27];
-            i += 28;
-            while chunk[i] != b' ' {
-                i += 1;
-            }
-            let from = i + 1;
-            let mut h = 0;
-            i = from;
-            // Eight bytes at a time: a zero byte in the word xor spaces marks the end of the endpoint.
-            while let Some(bytes) = chunk.get(i..i + 8) {
-                let word = u64::from_le_bytes(bytes.try_into().unwrap());
-                let x = word ^ 0x2020_2020_2020_2020;
-                let space = x.wrapping_sub(0x0101_0101_0101_0101) & !x & 0x8080_8080_8080_8080;
-                if space == 0 {
-                    h = mix(h, word);
-                    i += 8;
-                    continue;
-                }
-                let n = space.trailing_zeros() as usize / 8;
-                if n > 0 {
-                    h = mix(h, word & (u64::MAX >> (64 - 8 * n)));
-                }
-                i += n;
-                break;
-            }
-            if chunk[i] != b' ' {
-                // Fewer than eight bytes left in the chunk.
-                let end = i + chunk[i..].iter().position(|&b| b == b' ').unwrap();
-                h = fold(h, &chunk[i..end]);
-                i = end;
-            }
-            let endpoint = &chunk[from..i];
-            let error = chunk[i + 1] == b'5';
-            i += 5;
-            let mut latency = 0u32;
-            while i < chunk.len() && chunk[i] != b'\n' {
-                latency = latency * 10 + (chunk[i] - b'0') as u32;
-                i += 1;
-            }
+    let mut i = 0;
+    while i < chunk.len() {
+        // One forward pass over the line: ts SP method SP endpoint SP status SP latency LF.
+        let ts = &chunk[i..i + 27];
+        i += 28;
+        while chunk[i] != b' ' {
             i += 1;
-            let mut slot = (h >> 32) as usize & (slots.len() - 1);
-            let id = loop {
-                match slots[slot] {
-                    0 => {
-                        names.push(endpoint.to_vec());
-                        slots[slot] = names.len() as u32;
-                        start.resize(names.len() * hours, 0);
-                        errors.resize(names.len() * hours, 0);
-                        if names.len() * 2 > slots.len() {
-                            slots = vec![0; slots.len() * 2];
-                            for (id, name) in names.iter().enumerate() {
-                                let mut slot = (fold(0, name) >> 32) as usize & (slots.len() - 1);
-                                while slots[slot] != 0 {
-                                    slot = (slot + 1) & (slots.len() - 1);
-                                }
-                                slots[slot] = id as u32 + 1;
-                            }
-                        }
-                        break names.len() - 1;
-                    }
-                    s if names[s as usize - 1] == endpoint => break s as usize - 1,
-                    _ => slot = (slot + 1) & (slots.len() - 1),
-                }
-            };
-            let group = id * hours + hour_of(ts)?;
-            if rows.last().map_or(true, |block| block.len() == BLOCK) {
-                rows.push(Vec::with_capacity(BLOCK));
-            }
-            rows.last_mut()
-                .unwrap()
-                .push((group as u64) << 32 | latency as u64);
-            start[group] += 1;
-            errors[group] += error as u32;
         }
-        buf.copy_within(end..filled, 0);
-        carry = filled - end;
+        let from = i + 1;
+        let mut h = 0;
+        i = from;
+        // Eight bytes at a time: a zero byte in the word xor spaces marks the end of the endpoint.
+        while let Some(bytes) = chunk.get(i..i + 8) {
+            let word = u64::from_le_bytes(bytes.try_into().unwrap());
+            let x = word ^ 0x2020_2020_2020_2020;
+            let space = x.wrapping_sub(0x0101_0101_0101_0101) & !x & 0x8080_8080_8080_8080;
+            if space == 0 {
+                h = mix(h, word);
+                i += 8;
+                continue;
+            }
+            let n = space.trailing_zeros() as usize / 8;
+            if n > 0 {
+                h = mix(h, word & (u64::MAX >> (64 - 8 * n)));
+            }
+            i += n;
+            break;
+        }
+        if chunk[i] != b' ' {
+            // Fewer than eight bytes left in the chunk.
+            let end = i + chunk[i..].iter().position(|&b| b == b' ').unwrap();
+            h = fold(h, &chunk[i..end]);
+            i = end;
+        }
+        let endpoint = &chunk[from..i];
+        let error = chunk[i + 1] == b'5';
+        i += 5;
+        let mut latency = 0u32;
+        while i < chunk.len() && chunk[i] != b'\n' {
+            latency = latency * 10 + (chunk[i] - b'0') as u32;
+            i += 1;
+        }
+        i += 1;
+        let mut slot = (h >> 32) as usize & (slots.len() - 1);
+        let id = loop {
+            match slots[slot] {
+                0 => {
+                    names.push(endpoint);
+                    slots[slot] = names.len() as u32;
+                    start.resize(names.len() * hours, 0);
+                    errors.resize(names.len() * hours, 0);
+                    if names.len() * 2 > slots.len() {
+                        slots = vec![0; slots.len() * 2];
+                        for (id, name) in names.iter().enumerate() {
+                            let mut slot = (fold(0, name) >> 32) as usize & (slots.len() - 1);
+                            while slots[slot] != 0 {
+                                slot = (slot + 1) & (slots.len() - 1);
+                            }
+                            slots[slot] = id as u32 + 1;
+                        }
+                    }
+                    break names.len() - 1;
+                }
+                s if names[s as usize - 1] == endpoint => break s as usize - 1,
+                _ => slot = (slot + 1) & (slots.len() - 1),
+            }
+        };
+        let group = id * hours + hour_of(ts)?;
+        if rows.last().map_or(true, |block| block.len() == BLOCK) {
+            rows.push(Vec::with_capacity(BLOCK));
+        }
+        rows.last_mut()
+            .unwrap()
+            .push((group as u64) << 32 | latency as u64);
+        start[group] += 1;
+        errors[group] += error as u32;
     }
     // Counting sort of the latencies by group: turn the counts into end offsets, then place each
     // latency just below its group's end, which leaves every entry at the group's start offset.
@@ -167,18 +162,18 @@ fn scan(
     })
 }
 
-// Scan the byte ranges (a thread each) with one numbering of the hours; None if any line falls outside it.
-fn scan_all(
-    file: &File,
+// Scan the chunks (a thread each) with one numbering of the hours; None if any line falls outside it.
+fn scan_all<'a>(
+    input: &'a [u8],
     cuts: &[usize],
     hours: usize,
     hour_of: impl Fn(&[u8]) -> Option<usize> + Sync,
-) -> Option<Vec<Part>> {
+) -> Option<Vec<Part<'a>>> {
     std::thread::scope(|s| {
         let hour_of = &hour_of;
         let spawned: Vec<_> = cuts
             .windows(2)
-            .map(|w| s.spawn(move || scan(file, w[0]..w[1], hours, hour_of)))
+            .map(|w| s.spawn(move || scan(&input[w[0]..w[1]], hours, hour_of)))
             .collect();
         spawned.into_iter().map(|t| t.join().unwrap()).collect()
     })
@@ -188,22 +183,18 @@ fn main() {
     let mut args = std::env::args().skip(1);
     let data = args.next().unwrap_or_else(|| "/data".into());
     let out = args.next().unwrap_or_else(|| "/out".into());
-    let path = format!("{data}/requests.log");
-    let file = File::open(&path).unwrap();
-    let len = file.metadata().unwrap().len() as usize;
+    let input = map(&format!("{data}/requests.log"));
 
-    // Cut the file after a newline into one range per thread (a line is far shorter than 4096 bytes).
+    // Cut the file after a newline into one chunk per thread; each thread scans its own chunk.
     let threads = std::thread::available_parallelism().unwrap().get();
     let cuts: Vec<usize> = (0..=threads)
         .map(|i| {
-            let at = len * i / threads;
-            let mut block = [0; 4096];
-            let n = file.read_at(&mut block, at as u64).unwrap();
-            let k = block[..n].iter().position(|&b| b == b'\n');
+            let from = input.len() * i / threads;
+            let rest = input[from..].iter().position(|&b| b == b'\n');
             if i == 0 {
                 0
             } else {
-                at + k.map_or(n, |k| k + 1)
+                from + rest.map_or(input.len() - from, |n| n + 1)
             }
         })
         .collect();
@@ -214,9 +205,8 @@ fn main() {
     let mut labels: Vec<String> = (18..18 + HOURS)
         .map(|h| format!("{}T{:02}:00:00Z", days[h / 24], h % 24))
         .collect();
-    let parts = scan_all(&file, &cuts, HOURS, hour_index).unwrap_or_else(|| {
-        let all = std::fs::read(&path).unwrap();
-        let hours: BTreeSet<&[u8]> = all
+    let parts = scan_all(input, &cuts, HOURS, hour_index).unwrap_or_else(|| {
+        let hours: BTreeSet<&[u8]> = input
             .split(|&b| b == b'\n')
             .filter(|l| !l.is_empty())
             .map(|l| &l[..13])
@@ -226,14 +216,11 @@ fn main() {
             .map(|h| format!("{}:00:00Z", String::from_utf8_lossy(h)))
             .collect();
         let find = |ts: &[u8]| hours.iter().position(|h| *h == &ts[..13]);
-        scan_all(&file, &cuts, labels.len(), find).unwrap()
+        scan_all(input, &cuts, labels.len(), find).unwrap()
     });
 
     // All endpoints in output order (bytewise), and each thread's local id for each of them.
-    let mut names: Vec<&[u8]> = parts
-        .iter()
-        .flat_map(|p| p.names.iter().map(|n| n.as_slice()))
-        .collect();
+    let mut names: Vec<&[u8]> = parts.iter().flat_map(|p| p.names.iter().copied()).collect();
     names.sort_unstable();
     names.dedup();
     let maps: Vec<Vec<Option<usize>>> = parts
@@ -241,7 +228,7 @@ fn main() {
         .map(|p| {
             let mut map = vec![None; names.len()];
             for (id, name) in p.names.iter().enumerate() {
-                map[names.binary_search(&name.as_slice()).unwrap()] = Some(id);
+                map[names.binary_search(name).unwrap()] = Some(id);
             }
             map
         })
