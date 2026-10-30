@@ -147,19 +147,20 @@ fn scan<'a>(
         start[group] += 1;
         errors[group] += error as u32;
     }
-    // Counting sort of the latencies by group: turn the counts into start offsets, then place.
+    // Counting sort of the latencies by group: turn the counts into end offsets, then place each
+    // latency just below its group's end, which leaves every entry at the group's start offset.
     let mut sum = 0;
     for s in &mut start {
-        sum += std::mem::replace(s, sum);
+        sum += *s;
+        *s = sum;
     }
-    start.push(sum);
-    let mut next = start.clone();
     let mut lat = vec![0; rows.len()];
     for row in rows {
         let group = (row >> 32) as usize;
-        lat[next[group] as usize] = row as u32;
-        next[group] += 1;
+        start[group] -= 1;
+        lat[start[group] as usize] = row as u32;
     }
+    start.push(sum);
     Some(Part {
         names,
         errors,
