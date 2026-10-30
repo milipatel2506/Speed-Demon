@@ -22,15 +22,12 @@ fn percentile(sorted: &[u32], p: usize) -> u32 {
     sorted[(p * sorted.len() + 99) / 100 - 1]
 }
 
-fn main() {
-    let mut args = std::env::args().skip(1);
-    let data = args.next().unwrap_or_else(|| "/data".into());
-    let out = args.next().unwrap_or_else(|| "/out".into());
-    let input = map(&format!("{data}/requests.log"));
+// (hour "YYYY-MM-DDTHH", endpoint) -> (latencies, 5xx count).
+type Groups<'a> = HashMap<(&'a [u8], &'a [u8]), (Vec<u32>, u64)>;
 
-    // (hour "YYYY-MM-DDTHH", endpoint) -> (latencies, 5xx count).
-    let mut groups: HashMap<(&[u8], &[u8]), (Vec<u32>, u64)> = HashMap::new();
-    for line in input.split(|&b| b == b'\n').filter(|l| !l.is_empty()) {
+fn scan(chunk: &[u8]) -> Groups<'_> {
+    let mut groups = Groups::new();
+    for line in chunk.split(|&b| b == b'\n').filter(|l| !l.is_empty()) {
         let mut f = line.split(|&b| b == b' ');
         let ts = f.next().unwrap();
         let endpoint = f.nth(1).unwrap();
@@ -39,6 +36,37 @@ fn main() {
         let group = groups.entry((&ts[..13], endpoint)).or_default();
         group.0.push(latency);
         group.1 += (status[0] == b'5') as u64;
+    }
+    groups
+}
+
+fn main() {
+    let mut args = std::env::args().skip(1);
+    let data = args.next().unwrap_or_else(|| "/data".into());
+    let out = args.next().unwrap_or_else(|| "/out".into());
+    let input = map(&format!("{data}/requests.log"));
+
+    // Cut the file after a newline into one chunk per thread; each thread fills its own table.
+    let threads = std::thread::available_parallelism().unwrap().get();
+    let mut cuts = vec![0];
+    for i in 1..threads {
+        let from = (input.len() * i / threads).max(cuts[i - 1]);
+        let line_end = input[from..].iter().position(|&b| b == b'\n').map_or(0, |n| n + 1);
+        cuts.push(from + line_end);
+    }
+    cuts.push(input.len());
+    let tables: Vec<Groups> = std::thread::scope(|s| {
+        let spawned: Vec<_> = cuts.windows(2).map(|w| s.spawn(|| scan(&input[w[0]..w[1]]))).collect();
+        spawned.into_iter().map(|t| t.join().unwrap()).collect()
+    });
+    let mut tables = tables.into_iter();
+    let mut groups = tables.next().unwrap();
+    for table in tables {
+        for (key, (latencies, errors)) in table {
+            let group = groups.entry(key).or_default();
+            group.0.extend(latencies);
+            group.1 += errors;
+        }
     }
 
     // Output order: hour, then endpoint bytes, which is what tuple comparison gives.
