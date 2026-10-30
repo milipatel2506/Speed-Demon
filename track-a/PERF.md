@@ -23,6 +23,7 @@ Every step from the reference to your final version, each with the live-board ru
 | - | Failed experiments (Part 2 step 3), each against the step 2 binary over 15 interleaved runs, all with matching hashes: `MAP_POPULATE` (0x8002 flags) median 0.126 s to 0.134 s; `madvise(MADV_SEQUENTIAL)` 0.118 s to 0.123 s; `madvise(MADV_WILLNEED)` 0.123 s to 0.131 s. The page cache is already warm, so the 27,500 faults are minor faults that the 4 threads take in parallel inside the parse, and populating the mapping from one thread up front costs more than it saves. Reverted | | 0.13 | 58 | |
 | - | Failed experiments (Part 2 step 4), all with matching hashes. Dynamic load balancing: 4 chunks per thread taken from a shared `AtomicUsize`, one table per thread spanning its chunks. Against the step 2 binary: median 0.131 s to 0.123 s in one 25-run comparison, then 0.126 s to 0.129 s and 0.115 s to 0.121 s in two more, so no real gain, and one chunk per thread through the same code (0.138 s vs 0.140 s) is a tie. Per-thread scan times with equal chunks differ by only about 5% (60 to 64 ms on 4 threads). Thread count: 8 and 12 threads on this 4-CPU machine are slower (0.150 s and 0.160 s against 0.138 s) because they oversubscribe it, which says nothing about the box: there `available_parallelism` already returns 12, so '12 threads' is the current behaviour. Reverted | | 0.12 | 58 | |
 | 12 | Part 2 result, final build vs the Part 1 build, 15 interleaved runs on `full`: median 0.252 s to 0.138 s, min 0.214 s to 0.113 s. Kept: steps 1 and 2. Not kept: step 3 (`MAP_POPULATE`, `madvise`) and step 4 (dynamic chunks, 8 and 12 threads on 4 CPUs). Peak anonymous memory 49 to 58 MB. `main.rs` is 272 code lines after rustfmt. The image built offline and ran under the board limits with all three hashes matching (`full` 0.40 s wall including Docker start-up). The rows of the phase table measured in different sessions are not comparable with each other because the VM drifted by up to 30% (the same binary took 97 ms and 130 ms in total); the 'Same session' rows were taken back to back | | 0.14 | 49 | |
+| 13 | Memory step 1: pack each line's (group, latency) into one `u64` (group << 32 | latency) instead of a padded 16-byte tuple, which halves `rows`. Peak anonymous memory 57.0 MB to 33.1 MB (median of 7 sampled runs); time is a tie to slightly better, median 0.137 s to 0.132 s over 15 interleaved runs | | 0.13 | 33 | |
 
 Step 0 is the scoring box's calibration of the reference on seed 1. Steps 1 and later are measured on my dev machine (4 vCPU Xeon @ 2.1 GHz, warm page cache), not the scoring box, and have no board run ID yet, so replace them with the board's numbers. T is the median of 5 runs on `full`, and the same binary varies about 10% between sessions on this shared VM, so only compare rows measured back to back (seed 1) and M is the peak anonymous RSS, sampled from `/proc/<pid>/status` (RssAnon), which leaves out the file pages of the mapped input. Every row's output hash matched on tiny, sample and full. This machine has 4 CPUs, so the 12-thread step cannot show its full gain here.
 
@@ -100,6 +101,19 @@ Temporary timers in a scratchpad copy, not in the repo; one set of 5 runs per ro
 | Same session, final build, set 1 | 0.02 | 91.7 | 2.6 | 30.5 | 5.5 | 130.5 |
 | Same session, Part 1 build, set 2 | 0.01 | 180.0 | 2.7 | 32.0 | 5.5 | 217.4 |
 | Same session, final build, set 2 | 0.01 | 86.1 | 2.8 | 32.6 | 6.1 | 126.2 |
+
+### Memory breakdown (full, seed 1, sums over the 4 threads)
+
+Sizes printed from a scratchpad copy before any memory change. The peak is at the end of the scan, when each thread holds its `rows` (one entry per line) and the counting-sort output `lat` at the same time; the output pieces exist only after the rows are freed.
+
+| Buffer | Before, MB | Note |
+|---|---|---|
+| `rows`: one (group, latency) entry per line | 49.6 resident, 67.1 capacity | a `(usize, u32)` tuple is padded to 16 bytes; 3.1M lines |
+| `lat`: latencies after the counting sort | 12.4 | 4 bytes per line |
+| `start`, `errors` and the `next` clone | 2.4 + 2.4 + 2.1 | one slot per (endpoint, hour) per thread |
+| `slots` and `names` | 0.2 | |
+| Output pieces | 10.5 | live only after the scan |
+| Measured peak anonymous memory | 57.0 (median of 7 sampled runs) | |
 
 Not tried: PGO. The system `llvm-profdata` is LLVM 18 but `rustc` here is LLVM 22, so the raw profile could not be merged, and a profile built here would not match the compiler in the allowlisted `halloumee/speed-demon-rust` image anyway. I could not pull that image because Docker Hub rate-limited the sandbox (HTTP 429). It needs a machine with that image, a committed `.profdata` generated inside it, and `-C profile-use` in the Dockerfile.
 

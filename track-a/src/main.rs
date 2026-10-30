@@ -74,7 +74,7 @@ fn scan<'a>(
     let mut slots = vec![0u32; 4096]; // endpoint id + 1, or 0 for an empty slot; doubles when half full
     let mut names: Vec<&[u8]> = Vec::new();
     let (mut start, mut errors) = (Vec::new(), Vec::new()); // `start` counts requests until the sort below
-    let mut rows = Vec::new(); // (group, latency) for every line, in file order
+    let mut rows = Vec::new(); // group << 32 | latency for every line, in file order
     let mut i = 0;
     while i < chunk.len() {
         // One forward pass over the line: ts SP method SP endpoint SP status SP latency LF.
@@ -143,7 +143,7 @@ fn scan<'a>(
             }
         };
         let group = id * hours + hour_of(ts)?;
-        rows.push((group, latency));
+        rows.push((group as u64) << 32 | latency as u64);
         start[group] += 1;
         errors[group] += error as u32;
     }
@@ -155,8 +155,9 @@ fn scan<'a>(
     start.push(sum);
     let mut next = start.clone();
     let mut lat = vec![0; rows.len()];
-    for (group, latency) in rows {
-        lat[next[group] as usize] = latency;
+    for row in rows {
+        let group = (row >> 32) as usize;
+        lat[next[group] as usize] = row as u32;
         next[group] += 1;
     }
     Some(Part {
