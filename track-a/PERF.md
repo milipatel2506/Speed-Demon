@@ -29,6 +29,7 @@ Every step from the reference to your final version, each with the live-board ru
 | 15 | Memory step 4: keep `rows` in 64K-entry blocks (`Vec<Vec<u64>>`) that the counting sort frees as it consumes them, so the rows and the latency output no longer coexist in full. Peak anon 31.4 MB to 27.9 MB (median of 7 sampled runs). Time is level to slightly slower (25 runs: median 0.129 s to 0.131 s and 0.127 s to 0.130 s, mean 0.126 s to 0.126 s and 0.125 s to 0.127 s), about 5 more lines. Kept because the memory axis gains more than the time axis loses (about +2% in K against about -1%), but it is a close call | | 0.13 | 28 | |
 | 16 | Line count step 1: `render` becomes a closure inside `main` (no five-parameter signature or call site) and the chunk cuts become one iterator. `main.rs` goes from 279 to 262 code lines after rustfmt. Speed and memory unchanged: 25-run medians 0.123 s to 0.121 s and 0.118 s to 0.112 s, peak anon 29.4 MB to 30.2 MB (noise); all hashes and the three stress files pass | | 0.12 | 30 | |
 | 17 | Line count step 2: inline `hash`, `percentile` and `hour_label` at their single use and shorten the `mmap` call. `main.rs` goes from 262 to 251 code lines after rustfmt. Speed unchanged (25-run medians 0.132 s to 0.128 s and 0.131 s to 0.133 s); hashes and the three stress files pass | | 0.13 | 29 | |
+| 18 | Result of the memory and line-count work: peak anonymous memory 56.6 MB to 28.8 MB; `full` median 0.140 s to 0.136 s over 25 interleaved runs against the build before this work (min 0.122 s to 0.110 s, so no slowdown); `main.rs` 272 to 251 code lines after rustfmt. Image built offline and ran under the board limits, all three hashes matched, `full` took about 0.4 s wall including Docker start-up | | 0.14 | 29 | |
 
 Step 0 is the scoring box's calibration of the reference on seed 1. Steps 1 and later are measured on my dev machine (4 vCPU Xeon @ 2.1 GHz, warm page cache), not the scoring box, and have no board run ID yet, so replace them with the board's numbers. T is the median of 5 runs on `full`, and the same binary varies about 10% between sessions on this shared VM, so only compare rows measured back to back (seed 1) and M is the peak anonymous RSS, sampled from `/proc/<pid>/status` (RssAnon), which leaves out the file pages of the mapped input. Every row's output hash matched on tiny, sample and full. This machine has 4 CPUs, so the 12-thread step cannot show its full gain here.
 
@@ -106,6 +107,10 @@ Temporary timers in a scratchpad copy, not in the repo; one set of 5 runs per ro
 | Same session, final build, set 1 | 0.02 | 91.7 | 2.6 | 30.5 | 5.5 | 130.5 |
 | Same session, Part 1 build, set 2 | 0.01 | 180.0 | 2.7 | 32.0 | 5.5 | 217.4 |
 | Same session, final build, set 2 | 0.01 | 86.1 | 2.8 | 32.6 | 6.1 | 126.2 |
+| Same session, before the memory work, set 1 | 0.02 | 86.7 | 3.1 | 36.2 | 6.0 | 131.8 |
+| Same session, final build, set 1 | 0.02 | 82.1 | 2.8 | 36.2 | 6.8 | 129.1 |
+| Same session, before the memory work, set 2 | 0.02 | 82.5 | 3.1 | 31.0 | 6.0 | 121.2 |
+| Same session, final build, set 2 | 0.02 | 81.7 | 3.0 | 34.7 | 7.4 | 126.6 |
 
 ### Memory breakdown (full, seed 1, sums over the 4 threads)
 
@@ -119,6 +124,8 @@ Sizes printed from a scratchpad copy before any memory change. The peak is at th
 | `slots` and `names` | 0.2 | |
 | Output pieces | 10.5 | live only after the scan |
 | Measured peak anonymous memory | 57.0 (median of 7 sampled runs) | |
+
+After the memory changes (same run, same sums over 4 threads): `rows` 24.8 MB in 64K-entry blocks freed as the counting sort consumes them (was 49.6 resident), `lat` 12.4 MB (unchanged), `start` 2.1 and `errors` 2.1 (the `next` clone is gone), `slots` 0.07, output pieces 10.1 (live only after the scan). Measured peak anonymous memory: **56.6 MB to 28.8 MB** (median of 9 sampled runs; max 60.8 MB to 29.6 MB).
 
 ### Thread and merge overhead (full, 4 threads, scratchpad timers, 5 runs)
 
