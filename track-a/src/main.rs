@@ -179,6 +179,20 @@ fn scan_all<'a>(
     })
 }
 
+// Append `n` in decimal.
+fn push_decimal(text: &mut Vec<u8>, mut n: u64) {
+    let (mut digits, mut at) = ([0; 20], 20);
+    loop {
+        at -= 1;
+        digits[at] = b'0' + (n % 10) as u8;
+        n /= 10;
+        if n == 0 {
+            break;
+        }
+    }
+    text.extend_from_slice(&digits[at..]);
+}
+
 fn main() {
     let mut args = std::env::args().skip(1);
     let data = args.next().unwrap_or_else(|| "/data".into());
@@ -256,16 +270,17 @@ fn main() {
                 }
                 lat.sort_unstable();
                 let count = lat.len() as u64;
-                write!(text, "{} ", labels[hour]).unwrap();
+                text.extend_from_slice(labels[hour].as_bytes());
+                text.push(b' ');
                 text.extend_from_slice(name);
                 // Nearest rank: the value at 1-indexed rank ceil(p * n / 100).
-                let [p50, p95, p99] = [50, 95, 99].map(|p| lat[(p * lat.len() + 99) / 100 - 1]);
-                writeln!(
-                    text,
-                    " {count} {p50} {p95} {p99} {errors} {}",
-                    errors * 1_000_000 / count
-                )
-                .unwrap();
+                let [p50, p95, p99] =
+                    [50, 95, 99].map(|p| lat[(p * lat.len() + 99) / 100 - 1] as u64);
+                for n in [count, p50, p95, p99, errors, errors * 1_000_000 / count] {
+                    text.push(b' ');
+                    push_decimal(&mut text, n);
+                }
+                text.push(b'\n');
             }
         }
         text
