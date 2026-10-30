@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::hash::{BuildHasherDefault, Hasher};
 use std::fs::File;
 use std::io::Write;
 use std::os::fd::AsRawFd;
@@ -22,11 +23,31 @@ fn percentile(sorted: &[u32], p: usize) -> u32 {
     sorted[(p * sorted.len() + 99) / 100 - 1]
 }
 
+// A fast multiply-and-rotate hasher (FxHash style) in place of the default SipHash.
+#[derive(Default)]
+struct Fx(u64);
+
+impl Hasher for Fx {
+    fn write(&mut self, bytes: &[u8]) {
+        for chunk in bytes.chunks(8) {
+            let mut word = [0; 8];
+            word[..chunk.len()].copy_from_slice(chunk);
+            self.write_u64(u64::from_le_bytes(word));
+        }
+    }
+    fn write_u64(&mut self, n: u64) {
+        self.0 = (self.0.rotate_left(5) ^ n).wrapping_mul(0x517c_c1b7_2722_0a95);
+    }
+    fn finish(&self) -> u64 {
+        self.0.rotate_left(26)
+    }
+}
+
 // (hour "YYYY-MM-DDTHH", endpoint) -> (latencies, 5xx count).
-type Groups<'a> = HashMap<(&'a [u8], &'a [u8]), (Vec<u32>, u64)>;
+type Groups<'a> = HashMap<(&'a [u8], &'a [u8]), (Vec<u32>, u64), BuildHasherDefault<Fx>>;
 
 fn scan(chunk: &[u8]) -> Groups<'_> {
-    let mut groups = Groups::new();
+    let mut groups = Groups::default();
     for line in chunk.split(|&b| b == b'\n').filter(|l| !l.is_empty()) {
         let mut f = line.split(|&b| b == b' ');
         let ts = f.next().unwrap();

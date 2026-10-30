@@ -13,8 +13,25 @@ Every step from the reference to your final version, each with the live-board ru
 | - | Failed experiment (opt 4): `select_nth_unstable` for p99, then p95 and p50 in the prefix below it, instead of sorting each group. Same hashes, but no measurable gain (0.54 s vs 0.54 s and 0.49 s vs 0.55 s, A/B back to back): the average group holds about 24 latencies, so the sort is already cheap, and it added about 9 lines of code. Reverted | | 0.52 | 53 | |
 | - | Failed experiment (opt 5a): `lto = "fat"`, `codegen-units = 1`, `panic = "abort"` in the release profile (opt-level 3 was already set). Same hashes, no gain: 0.51 s and 0.52 s against 0.48 s and 0.52 s for the same code without them, so I left the profile alone | | 0.52 | 54 | |
 | 5 | Opt 5b: `-C target-cpu=native` in `.cargo/config.toml`. Five A/B pairs against the generic build, native faster in all five (median 0.46 s vs 0.50 s on average). The board's own scan finds the flag, so this track is built on the scoring box, as the harness README says. The generic build is the fallback if that ever matters | | 0.46 | 53 | |
+| 6 | Opt 6: FxHash-style multiply-rotate hasher (`BuildHasherDefault<Fx>`, std only) in place of SipHash. Chosen from the phase table below. Interleaved 15 runs of each build: median 0.503 s to 0.453 s, min 0.433 s to 0.386 s | | 0.45 | 54 | |
 
 Step 0 is the scoring box's calibration of the reference on seed 1. Steps 1 and later are measured on my dev machine (4 vCPU Xeon @ 2.1 GHz, warm page cache), not the scoring box, and have no board run ID yet, so replace them with the board's numbers. T is the median of 5 runs on `full`, and the same binary varies about 10% between sessions on this shared VM, so only compare rows measured back to back (seed 1) and M is the peak anonymous RSS, sampled from `/proc/<pid>/status` (RssAnon), which leaves out the file pages of the mapped input. Every row's output hash matched on tiny, sample and full. This machine has 4 CPUs, so the 12-thread step cannot show its full gain here.
+
+## Where the time goes (full, seed 1, before opt 6)
+
+Temporary timers, since removed, around each phase, 5 runs each, median per phase, in milliseconds. Two complete sets are shown because this shared VM drifts by 10% or more between sets. After opt 6, the same timers gave a set of 483 ms total and a later set of 548 ms, and the phase numbers moved by more than the change itself, so only the 15-run interleaved comparison above is evidence for the hasher.
+
+| Phase | Before, set 1 | Before, set 2 | After opt 6, set 1 | After opt 6, set 2 |
+|---|---|---|---|---|
+| `mmap` call | 0.02 | 0.01 | 0.02 | 0.02 |
+| Parallel parse (spawn, scan, join; includes the page faults) | 233.9 | 240.5 | 221.5 | 262.5 |
+| Merge the per-thread tables | 128.1 | 102.7 | 96.4 | 99.3 |
+| Sort the group list | 42.1 | 42.0 | 44.7 | 54.8 |
+| Percentile sort and formatting | 91.0 | 117.6 | 94.9 | 118.2 |
+| Write `summary.txt` | 6.2 | 7.1 | 7.3 | 6.8 |
+| Total | 500.3 | 505.5 | 483.5 | 547.6 |
+
+About 27,500 minor page faults happen, all inside the parse phase. The parse is roughly half the run, the merge and the percentile step about a fifth each, and the group sort about a tenth. The hasher touches the parse (3.1 million lookups) and the merge (about 500,000 re-inserts), which is why it was the candidate the timings justified. `MAP_POPULATE` and `madvise` were not tried: the `mmap` call itself costs nothing, and the faults are spread over 4 threads inside a phase that is mostly parsing, so the most they could save is a fraction of that half. The merge, the group sort and the percentile step are the next targets.
 
 Not tried: PGO. The system `llvm-profdata` is LLVM 18 but `rustc` here is LLVM 22, so the raw profile could not be merged, and a profile built here would not match the compiler in the allowlisted `halloumee/speed-demon-rust` image anyway. I could not pull that image because Docker Hub rate-limited the sandbox (HTTP 429). It needs a machine with that image, a committed `.profdata` generated inside it, and `-C profile-use` in the Dockerfile.
 
