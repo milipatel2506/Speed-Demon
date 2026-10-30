@@ -2,6 +2,7 @@ use std::collections::BTreeSet;
 use std::fs::File;
 use std::io::Write;
 use std::os::fd::AsRawFd;
+use std::ptr::null_mut;
 
 extern "C" {
     fn mmap(addr: *mut u8, len: usize, prot: i32, flags: i32, fd: i32, off: i64) -> *mut u8;
@@ -14,12 +15,7 @@ fn map(path: &str) -> &'static [u8] {
     if len == 0 {
         return &[];
     }
-    unsafe {
-        std::slice::from_raw_parts(
-            mmap(std::ptr::null_mut(), len, 1, 2, file.as_raw_fd(), 0),
-            len,
-        )
-    }
+    unsafe { std::slice::from_raw_parts(mmap(null_mut(), len, 1, 2, file.as_raw_fd(), 0), len) }
 }
 
 const HOURS: usize = 72;
@@ -34,11 +30,6 @@ fn hour_index(ts: &[u8]) -> Option<usize> {
     (&ts[..4] == b"2026" && (0..HOURS as isize).contains(&hour)).then_some(hour as usize)
 }
 
-fn hour_label(hour: usize) -> String {
-    let days = ["2026-10-30", "2026-10-31", "2026-11-01", "2026-11-02"];
-    format!("{}T{:02}:00:00Z", days[(hour + 18) / 24], (hour + 18) % 24)
-}
-
 // FxHash-style multiply-rotate hash, folding in the bytes 8 at a time (the last word zero-padded).
 fn fold(mut h: u64, bytes: &[u8]) -> u64 {
     for chunk in bytes.chunks(8) {
@@ -51,10 +42,6 @@ fn fold(mut h: u64, bytes: &[u8]) -> u64 {
 
 fn mix(h: u64, word: u64) -> u64 {
     (h.rotate_left(5) ^ word).wrapping_mul(0x517c_c1b7_2722_0a95)
-}
-
-fn hash(bytes: &[u8]) -> usize {
-    (fold(0, bytes) >> 32) as usize
 }
 
 // One thread's share of the file. A group is (endpoint id, hour number), numbered id * hours + hour,
@@ -130,7 +117,7 @@ fn scan<'a>(
                     if names.len() * 2 > slots.len() {
                         slots = vec![0; slots.len() * 2];
                         for (id, name) in names.iter().enumerate() {
-                            let mut slot = hash(name) & (slots.len() - 1);
+                            let mut slot = (fold(0, name) >> 32) as usize & (slots.len() - 1);
                             while slots[slot] != 0 {
                                 slot = (slot + 1) & (slots.len() - 1);
                             }
@@ -192,11 +179,6 @@ fn scan_all<'a>(
     })
 }
 
-// Nearest rank: the value at 1-indexed rank ceil(p * n / 100).
-fn percentile(sorted: &[u32], p: usize) -> u32 {
-    sorted[(p * sorted.len() + 99) / 100 - 1]
-}
-
 fn main() {
     let mut args = std::env::args().skip(1);
     let data = args.next().unwrap_or_else(|| "/data".into());
@@ -219,7 +201,10 @@ fn main() {
 
     // Fast path: the spec's 72-hour window. If any timestamp is outside it, number the distinct hours
     // actually present (their first 13 bytes, which sort chronologically) and scan again.
-    let mut labels: Vec<String> = (0..HOURS).map(hour_label).collect();
+    let days = ["2026-10-30", "2026-10-31", "2026-11-01", "2026-11-02"];
+    let mut labels: Vec<String> = (18..18 + HOURS)
+        .map(|h| format!("{}T{:02}:00:00Z", days[h / 24], h % 24))
+        .collect();
     let parts = scan_all(input, &cuts, HOURS, hour_index).unwrap_or_else(|| {
         let hours: BTreeSet<&[u8]> = input
             .split(|&b| b == b'\n')
@@ -273,7 +258,8 @@ fn main() {
                 let count = lat.len() as u64;
                 write!(text, "{} ", labels[hour]).unwrap();
                 text.extend_from_slice(name);
-                let [p50, p95, p99] = [50, 95, 99].map(|p| percentile(&lat, p));
+                // Nearest rank: the value at 1-indexed rank ceil(p * n / 100).
+                let [p50, p95, p99] = [50, 95, 99].map(|p| lat[(p * lat.len() + 99) / 100 - 1]);
                 writeln!(
                     text,
                     " {count} {p50} {p95} {p99} {errors} {}",
