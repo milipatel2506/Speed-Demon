@@ -23,6 +23,7 @@ fn map(path: &str) -> &'static [u8] {
 }
 
 const HOURS: usize = 72;
+const BLOCK: usize = 1 << 16;
 
 // Hour number 0..72 of a timestamp in the 72 hours from 2026-10-30T18:00Z that the spec promises,
 // or None for any other timestamp.
@@ -74,7 +75,7 @@ fn scan<'a>(
     let mut slots = vec![0u32; 4096]; // endpoint id + 1, or 0 for an empty slot; doubles when half full
     let mut names: Vec<&[u8]> = Vec::new();
     let (mut start, mut errors) = (Vec::new(), Vec::new()); // `start` counts requests until the sort below
-    let mut rows = Vec::new(); // group << 32 | latency for every line, in file order
+    let mut rows: Vec<Vec<u64>> = Vec::new(); // group << 32 | latency per line, in blocks freed as the sort consumes them
     let mut i = 0;
     while i < chunk.len() {
         // One forward pass over the line: ts SP method SP endpoint SP status SP latency LF.
@@ -143,7 +144,12 @@ fn scan<'a>(
             }
         };
         let group = id * hours + hour_of(ts)?;
-        rows.push((group as u64) << 32 | latency as u64);
+        if rows.last().map_or(true, |block| block.len() == BLOCK) {
+            rows.push(Vec::with_capacity(BLOCK));
+        }
+        rows.last_mut()
+            .unwrap()
+            .push((group as u64) << 32 | latency as u64);
         start[group] += 1;
         errors[group] += error as u32;
     }
@@ -154,8 +160,8 @@ fn scan<'a>(
         sum += *s;
         *s = sum;
     }
-    let mut lat = vec![0; rows.len()];
-    for row in rows {
+    let mut lat = vec![0; rows.iter().map(Vec::len).sum()];
+    for row in rows.into_iter().flatten() {
         let group = (row >> 32) as usize;
         start[group] -= 1;
         lat[start[group] as usize] = row as u32;
