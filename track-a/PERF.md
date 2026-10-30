@@ -14,6 +14,7 @@ Every step from the reference to your final version, each with the live-board ru
 | - | Failed experiment (opt 5a): `lto = "fat"`, `codegen-units = 1`, `panic = "abort"` in the release profile (opt-level 3 was already set). Same hashes, no gain: 0.51 s and 0.52 s against 0.48 s and 0.52 s for the same code without them, so I left the profile alone | | 0.52 | 54 | |
 | 5 | Opt 5b: `-C target-cpu=native` in `.cargo/config.toml`. Five A/B pairs against the generic build, native faster in all five (median 0.46 s vs 0.50 s on average). The board's own scan finds the flag, so this track is built on the scoring box, as the harness README says. The generic build is the fallback if that ever matters | | 0.46 | 53 | |
 | 6 | Opt 6: FxHash-style multiply-rotate hasher (`BuildHasherDefault<Fx>`, std only) in place of SipHash. Chosen from the phase table below. Interleaved 15 runs of each build: median 0.503 s to 0.453 s, min 0.433 s to 0.386 s | | 0.45 | 54 | |
+| 7 | Opt 7: new data layout. Endpoints interned in a 4096-slot open-addressing table per thread (Fx-style hash, names stored once); a group is (endpoint id, hour number) with flat per-thread arrays for 5xx counts and a counting sort of the latencies by group, so there is no per-group allocation and no `HashMap`; merging is just ranking the endpoint names once (sorted bytewise) and mapping each thread's ids to ranks, then output iterates hour by hour over the sorted names, so the 127k groups are never sorted. Interleaved 15 runs vs opt 6: median 0.466 s to 0.319 s, min 0.393 s to 0.264 s | | 0.32 | 49 | |
 
 Step 0 is the scoring box's calibration of the reference on seed 1. Steps 1 and later are measured on my dev machine (4 vCPU Xeon @ 2.1 GHz, warm page cache), not the scoring box, and have no board run ID yet, so replace them with the board's numbers. T is the median of 5 runs on `full`, and the same binary varies about 10% between sessions on this shared VM, so only compare rows measured back to back (seed 1) and M is the peak anonymous RSS, sampled from `/proc/<pid>/status` (RssAnon), which leaves out the file pages of the mapped input. Every row's output hash matched on tiny, sample and full. This machine has 4 CPUs, so the 12-thread step cannot show its full gain here.
 
@@ -32,6 +33,22 @@ Temporary timers, since removed, around each phase, 5 runs each, median per phas
 | Total | 500.3 | 505.5 | 483.5 | 547.6 |
 
 About 27,500 minor page faults happen, all inside the parse phase. The parse is roughly half the run, the merge and the percentile step about a fifth each, and the group sort about a tenth. The hasher touches the parse (3.1 million lookups) and the merge (about 500,000 re-inserts), which is why it was the candidate the timings justified. `MAP_POPULATE` and `madvise` were not tried: the `mmap` call itself costs nothing, and the faults are spread over 4 threads inside a phase that is mostly parsing, so the most they could save is a fraction of that half. The merge, the group sort and the percentile step are the next targets.
+
+### After opt 7 (interned endpoints and flat storage), full, median of 5 runs, ms
+
+Two sets, same drift caveat. The timers are in a scratchpad copy, not in the repo. Parse now includes each thread's counting sort of its latencies. The old merge and group-sort phases are gone: "rank" is naming and mapping the endpoints once.
+
+| Phase | Opt 6, set 1 | Opt 6, set 2 | Opt 7, set 1 | Opt 7, set 2 |
+|---|---|---|---|---|
+| `mmap` call | 0.02 | 0.01 | 0.02 | 0.02 |
+| Parallel parse (scan, intern, counting sort) | 221.5 | 240.5 | 191.5 | 206.2 |
+| Merge tables / rank endpoint names | 96.4 | 102.7 | 3.4 | 2.7 |
+| Sort the group list | 44.7 | 42.0 | none | none |
+| Percentile sort and formatting (serial) | 94.9 | 117.6 | 108.5 | 100.9 |
+| Write `summary.txt` | 7.3 | 7.1 | 7.0 | 6.8 |
+| Total | 483.5 | 505.5 | 326.3 | 316.4 |
+
+Opt 7 assumes the spec's fixed 72-hour span (every timestamp lies between 2026-10-30T18:00:00Z and 2026-11-02T17:59:59Z for every seed and scale, section 2 of the spec) and at most 4,095 distinct endpoints (the catalogue is 1,842).
 
 Not tried: PGO. The system `llvm-profdata` is LLVM 18 but `rustc` here is LLVM 22, so the raw profile could not be merged, and a profile built here would not match the compiler in the allowlisted `halloumee/speed-demon-rust` image anyway. I could not pull that image because Docker Hub rate-limited the sandbox (HTTP 429). It needs a machine with that image, a committed `.profdata` generated inside it, and `-C profile-use` in the Dockerfile.
 
