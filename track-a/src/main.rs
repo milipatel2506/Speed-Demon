@@ -38,13 +38,22 @@ fn hour_label(hour: usize) -> String {
     format!("{}T{:02}:00:00Z", days[(hour + 18) / 24], (hour + 18) % 24)
 }
 
-// FxHash-style multiply-rotate step; an endpoint's hash folds in its bytes one at a time.
-fn mix(h: u64, byte: u8) -> u64 {
-    (h.rotate_left(5) ^ byte as u64).wrapping_mul(0x517c_c1b7_2722_0a95)
+// FxHash-style multiply-rotate hash, folding in the bytes 8 at a time (the last word zero-padded).
+fn fold(mut h: u64, bytes: &[u8]) -> u64 {
+    for chunk in bytes.chunks(8) {
+        let mut word = [0; 8];
+        word[..chunk.len()].copy_from_slice(chunk);
+        h = mix(h, u64::from_le_bytes(word));
+    }
+    h
+}
+
+fn mix(h: u64, word: u64) -> u64 {
+    (h.rotate_left(5) ^ word).wrapping_mul(0x517c_c1b7_2722_0a95)
 }
 
 fn hash(bytes: &[u8]) -> usize {
-    (bytes.iter().fold(0, |h, &b| mix(h, b)) >> 32) as usize
+    (fold(0, bytes) >> 32) as usize
 }
 
 // One thread's share of the file. A group is (endpoint id, hour number), numbered id * hours + hour,
@@ -77,9 +86,28 @@ fn scan<'a>(
         let from = i + 1;
         let mut h = 0;
         i = from;
-        while chunk[i] != b' ' {
-            h = mix(h, chunk[i]);
-            i += 1;
+        // Eight bytes at a time: a zero byte in the word xor spaces marks the end of the endpoint.
+        while let Some(bytes) = chunk.get(i..i + 8) {
+            let word = u64::from_le_bytes(bytes.try_into().unwrap());
+            let x = word ^ 0x2020_2020_2020_2020;
+            let space = x.wrapping_sub(0x0101_0101_0101_0101) & !x & 0x8080_8080_8080_8080;
+            if space == 0 {
+                h = mix(h, word);
+                i += 8;
+                continue;
+            }
+            let n = space.trailing_zeros() as usize / 8;
+            if n > 0 {
+                h = mix(h, word & (u64::MAX >> (64 - 8 * n)));
+            }
+            i += n;
+            break;
+        }
+        if chunk[i] != b' ' {
+            // Fewer than eight bytes left in the chunk.
+            let end = i + chunk[i..].iter().position(|&b| b == b' ').unwrap();
+            h = fold(h, &chunk[i..end]);
+            i = end;
         }
         let endpoint = &chunk[from..i];
         let error = chunk[i + 1] == b'5';
