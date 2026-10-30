@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::HashMap;
 use std::fs::File;
 use std::io::Write;
 use std::os::fd::AsRawFd;
@@ -28,9 +28,8 @@ fn main() {
     let out = args.next().unwrap_or_else(|| "/out".into());
     let input = map(&format!("{data}/requests.log"));
 
-    // (hour "YYYY-MM-DDTHH", endpoint) -> (latencies, 5xx count). The BTreeMap key order
-    // is hour, then endpoint bytes, which is the required output order.
-    let mut groups: BTreeMap<(&[u8], &[u8]), (Vec<u32>, u64)> = BTreeMap::new();
+    // (hour "YYYY-MM-DDTHH", endpoint) -> (latencies, 5xx count).
+    let mut groups: HashMap<(&[u8], &[u8]), (Vec<u32>, u64)> = HashMap::new();
     for line in input.split(|&b| b == b'\n').filter(|l| !l.is_empty()) {
         let mut f = line.split(|&b| b == b' ');
         let ts = f.next().unwrap();
@@ -41,6 +40,10 @@ fn main() {
         group.0.push(latency);
         group.1 += (status[0] == b'5') as u64;
     }
+
+    // Output order: hour, then endpoint bytes, which is what tuple comparison gives.
+    let mut groups: Vec<_> = groups.into_iter().collect();
+    groups.sort_unstable_by_key(|g| g.0);
 
     let mut text = Vec::new();
     for ((hour, endpoint), (mut latencies, errors)) in groups {
