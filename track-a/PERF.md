@@ -118,6 +118,20 @@ Sizes printed from a scratchpad copy before any memory change. The peak is at th
 | Output pieces | 10.5 | live only after the scan |
 | Measured peak anonymous memory | 57.0 (median of 7 sampled runs) | |
 
+### Thread and merge overhead (full, 4 threads, scratchpad timers, 5 runs)
+
+Measured to check that the fixed costs are small; no code changed.
+
+| Cost | Median, ms | Max, ms |
+|---|---|---|
+| Spawn loop for all scan threads | 0.19 | 0.28 |
+| A scan thread's start latency after spawning began | 0.39 | 7.3 (one scheduling outlier in 20) |
+| Counting sort alone, per thread (includes allocating its output) | 7.2 | 8.5 |
+| A whole scan thread, counting sort included | 82.6 | 105.4 |
+| Rank endpoint names / map thread ids (the whole merge) | 2.6 | |
+
+Spawning, start-up and the merge cost well under 1% of the run between them. The counting sort is about 9% of each scan thread, but it is real work (3.1M scattered writes), not overhead.
+
 Not tried: PGO. The system `llvm-profdata` is LLVM 18 but `rustc` here is LLVM 22, so the raw profile could not be merged, and a profile built here would not match the compiler in the allowlisted `halloumee/speed-demon-rust` image anyway. I could not pull that image because Docker Hub rate-limited the sandbox (HTTP 429). It needs a machine with that image, a committed `.profdata` generated inside it, and `-C profile-use` in the Dockerfile.
 
 Final check of the finished code: the image built offline with `--network=none` and ran under the board's limits (read-only root, 1 GB `/tmp`, uid 65534, `/data` read-only, 4 CPUs). `/out` held only `summary.txt`, and all three hashes matched. Full took 0.98 s wall including `docker run` start-up (about 0.5 s of that is Docker, not the program). The box has 12 threads, so expect the threaded scan to do better there than on this 4-CPU machine.
