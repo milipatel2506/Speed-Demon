@@ -1,3 +1,54 @@
+# Track A: summary (one screen)
+
+**Final board result:** T 0.0520 s, M 53.7 MB, S 293, D 1, K 25.86 (machine points 50 x log10(K) = 70.6, before the judge share). Reference: T 32.05 s, M 228 MB, S 56, D 1. Check: (32.05 / 0.0520)^0.5 x (228 / 53.7)^0.2 x (56 / 293)^0.15 = 25.9.
+
+| Board row (numbers as reported from the board) | T, s | M, MB | S | K |
+|---|---|---|---|---|
+| An earlier row | 0.063 | 52 | 258 | |
+| Best build before the last change (cec700a) | 0.05716 | 54.5 | 292 | 24.61 |
+| V1: 12 workers, 96 chunks (reverted) | 0.05991 | 54.2 | 311 | 23.83 |
+| V2: 6 workers, 96 chunks (reverted) | 0.06784 | 44.6 | 311 | 23.29 |
+| **Final (hashed endpoint ranking, this submission)** | **0.0520** | **53.7** | **293** | **25.86** |
+
+Run IDs in the tables below are blank: the board's run IDs were not visible from the development environment. All times below that are not board rows were measured on a 4-CPU VM (the scoring box has 12 threads on six SMT cores), as medians of interleaved runs on the `full` seed-1 data; since the VM drifts by 10% or more between sessions, later changes were timed as paired rounds against the previous binary, and a 41-round control of one binary against itself shows a noise of about +-10 ms (IQR).
+
+**What worked (local, in order):**
+
+| Change | Measured gain |
+|---|---|
+| Simple std-only Rust instead of the Python reference | 33.7 s to 1.90 s |
+| `mmap` plus a byte parser (no `str`, no `datetime`) | 1.90 s to 1.39 s |
+| `HashMap` instead of `BTreeMap`; sort the groups once | 1.39 s to 0.85 s |
+| One thread per CPU, newline-aligned chunks | 0.85 s to 0.57 s |
+| `-C target-cpu=native` | about 8% (0.50 s to 0.46 s) |
+| FxHash-style hasher instead of SipHash | 0.503 s to 0.453 s |
+| Interned endpoints, flat per-thread arrays, counting sort, ranked output | 0.466 s to 0.319 s |
+| Render on all threads | 0.325 s to 0.220 s |
+| One forward scan per line | 0.206 s to 0.136 s |
+| Eight bytes at a time for the endpoint scan | 0.135 s to 0.114 s |
+| Packed `u64` rows freed block by block (memory) | peak 57 MB to 28 MB, no slowdown |
+| Direct number formatting in the render | about 5% (0.110 s to 0.104 s) |
+| Hour cache, SWAR latency parse, render loop interchange, no concatenation | wall -9 to -13 ms, cpu -30 to -36 ms (61 paired rounds) |
+| Hash set and map for the endpoint-name ranking | ranking stage 8.3 ms to 3.8 ms with 12 workers |
+
+**What failed, and why (all kept out of the code; details in the log below):**
+
+| Experiment | Why it failed |
+|---|---|
+| V1 and V2 (96 chunks claimed by 12 or 6 workers, render tasks) | Board: slower than the one-chunk-per-thread build (K 23.83 and 23.29 against 24.61) and 19 more lines; V2 was a further 13% slower than V1 with half the threads |
+| LTO, `codegen-units = 1`, `panic = "abort"` | No gain |
+| Last-key cache, previous-endpoint check, cheaper endpoint hash | Consecutive lines rarely share an endpoint; the hash multiplies hide behind the delimiter search |
+| `MAP_POPULATE`, `madvise`, huge-page tunable, `pread` instead of `mmap` | Page cache is warm and the faults are taken in parallel; each was a tie or slower |
+| AVX2 delimiter search | Tie, 52 more lines; field extraction is bound by streaming the input, not by compares |
+| Two-pass layout without the row buffer | 31% slower: the second pass re-parses every line |
+| Percentile selection, parallel `pwrite`, early `exit`, pre-sized output file, reserved output buffers | Ties, or CPU saved that wall time did not show |
+| More threads than CPUs, dynamic chunks | Oversubscription; load was already within 5% |
+| PGO with build-time training (allowlisted llvm-tools image) | Builds offline and passes all gates, but at most 1% faster, inside the noise; not adopted |
+
+Safety: the program does not rely on sorted input, on the 72-hour window (a slower second scan numbers the hours actually present), on at most 4,095 endpoints (the intern table doubles), or on a final newline; unreadable input or an unwritable output gives a one-line error and exit code 1. Verified against the reference hashes on seeds 1 to 4 at tiny, sample and full scale, the spec's worked example, empty input, three hand-made stress files (576 hours, 5,000 endpoints, no final newline) at 1 and 4 CPUs, builds with 1, 6 and 12 workers forced, and the board's own `run_submission.py` gates.
+
+---
+
 # Track A: performance log
 
 Every step from the reference to your final version, each with the live-board run ID that measured it. Judges check that the run IDs exist and that each change moved the way you say it did.
@@ -48,6 +99,7 @@ Every step from the reference to your final version, each with the live-board ru
 | - | Failed experiment, board-tested (variant V1, commit 206133a, reverted): 96 small chunks and 24 three-hour render tasks claimed from shared atomic counters by min(12, cpus) workers, one set of tables per worker, merged at the end. Board result: T 0.05991 s, M 54.2 MB, S 311, K 23.83. Against the best build cec700a (T 0.05716 s, M 54.5 MB, S 292, K 24.61) it is slower by 4.8%, uses the same memory, and costs 19 more code lines, so K is lower. The 12-worker, many-chunk layout did not pay on the box. Possible causes, not measured: twelve parts make the render gather more work per group, and the 24 small render tasks read each part's counts in shorter runs than the tip's one run of hours per thread; the extra 19 lines also cost K directly. Locally (4 CPUs) it had been a wall tie and +17 ms cpu. Reverted by a new commit, no force push | | 0.0599 | 54.2 | |
 | - | Failed experiment, board-tested (variant V2, commit c9e1c18, reverted): the V1 layout with the worker cap at 6 instead of 12 (96 chunks and 24 render tasks claimed from shared counters). Board result: T 0.06784 s, M 44.6 MB, S 311, K 23.29, against the best build cec700a (T 0.05716 s, M 54.5 MB, S 292, K 24.61). Slower than both V1 and the best build; the memory is lower, but not enough to pay for the time. Reverted by a new commit, no force push | | 0.0678 | 44.6 | |
 | 30 | Serial-path step (kept): endpoint-name ranking with a HashSet and a HashMap instead of a 22k-name sort and a binary search per name and part. Ranking stage 8.28 ms to 3.78 ms with 12 workers forced; whole-run paired timing wall -1.2 and -1.3 ms (12 workers forced), -1.6 ms (4 workers). Three other candidates (exit without dropping, parallel pwrite, pre-sized output file) were tried and did not help; see the serial-path audit. Verified: three seed-1 hashes, seeds 2, 3 and 4, spec example, empty input, the three stress files at 1 and 4 CPUs, the board's run_submission.py gates, and a build with 12 workers forced. 285 to 286 code lines (+1) | | 0.057 | 54 | |
+| 31 | Final polish (no change in behaviour or speed): I/O failures now print one line and exit with code 1 instead of panicking (missing or unreadable input, a directory in place of the file, an unwritable output; a failed `mmap` is checked, which it was not before), `available_parallelism` falls back to one thread instead of panicking, each `unsafe` block has a safety note, the hash and the word-at-a-time scan are explained, the redundant length test in the latency parse and the `loop`/`break` in `push_decimal` are gone, and the chunk cuts are one iterator chain. `main.rs` 286 to 288 code lines after rustfmt (+2). Re-verified after the edit: seeds 1 to 4 at tiny, sample and full scale against the reference hashes, spec example, empty input, the three stress files and the one-line file at 1 and 4 CPUs, builds with 12, 6 and 1 workers forced, the board's run_submission.py gates; 41 paired rounds against the previous build: wall -0.5 ms (a tie) | | 0.052 | 53.7 | |
 
 Step 0 is the scoring box's calibration of the reference on seed 1. Steps 1 and later are measured on my dev machine (4 vCPU Xeon @ 2.1 GHz, warm page cache), not the scoring box, and have no board run ID yet, so replace them with the board's numbers. T is the median of 5 runs on `full`, and the same binary varies about 10% between sessions on this shared VM, so only compare rows measured back to back (seed 1) and M is the peak anonymous RSS, sampled from `/proc/<pid>/status` (RssAnon), which leaves out the file pages of the mapped input. Every row's output hash matched on tiny, sample and full. This machine has 4 CPUs, so the 12-thread step cannot show its full gain here.
 

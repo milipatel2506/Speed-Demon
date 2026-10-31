@@ -2,20 +2,31 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fs::File;
 use std::io::Write;
 use std::os::fd::AsRawFd;
-use std::ptr::null_mut;
 
 extern "C" {
     fn mmap(addr: *mut u8, len: usize, prot: i32, flags: i32, fd: i32, off: i64) -> *mut u8;
 }
 
+// Report a failure on `path` plainly and exit non-zero, instead of panicking.
+fn fail(path: &str, error: std::io::Error) -> ! {
+    eprintln!("error: {path}: {error}");
+    std::process::exit(1)
+}
+
 // Map the file read-only (PROT_READ, MAP_PRIVATE) instead of reading it onto the heap.
 fn map(path: &str) -> &'static [u8] {
-    let file = File::open(path).unwrap();
-    let len = file.metadata().unwrap().len() as usize;
+    let file = File::open(path).unwrap_or_else(|e| fail(path, e));
+    let len = file.metadata().unwrap_or_else(|e| fail(path, e)).len() as usize;
     if len == 0 {
         return &[];
     }
-    unsafe { std::slice::from_raw_parts(mmap(null_mut(), len, 1, 2, file.as_raw_fd(), 0), len) }
+    // SAFETY: a null hint, a valid open fd and the file's own length; the result is checked below.
+    let addr = unsafe { mmap(std::ptr::null_mut(), len, 1, 2, file.as_raw_fd(), 0) };
+    if addr as isize == -1 {
+        fail(path, std::io::Error::last_os_error());
+    }
+    // SAFETY: `addr` is a successful mapping of `len` readable bytes that is never unmapped.
+    unsafe { std::slice::from_raw_parts(addr, len) }
 }
 
 const HOURS: usize = 72;
@@ -37,7 +48,9 @@ fn digits8(mut w: u64) -> u32 {
     ((low * 0x000f_4240_0000_0064 + high * 0x0000_2710_0000_0001) >> 32) as u32
 }
 
-// FxHash-style multiply-rotate hash, folding in the bytes 8 at a time (the last word zero-padded).
+// FxHash-style multiply-rotate hash, folding in the bytes 8 at a time (the last word zero-padded):
+// each word is xored into the rotated running value and multiplied by an odd constant, so that every
+// input bit reaches the top 32 bits, which pick the table slot.
 fn fold(mut h: u64, bytes: &[u8]) -> u64 {
     for chunk in bytes.chunks(8) {
         let mut word = [0; 8];
@@ -82,7 +95,8 @@ fn scan<'a>(
         let from = i + 1;
         let mut h = 0;
         i = from;
-        // Eight bytes at a time: a zero byte in the word xor spaces marks the end of the endpoint.
+        // Eight bytes at a time. XOR with spaces turns a space into a zero byte, and (x - 0x01..) & !x & 0x80..
+        // sets the high bit of the lowest zero byte (higher bytes may give false hits, which are ignored).
         while let Some(bytes) = chunk.get(i..i + 8) {
             let word = u64::from_le_bytes(bytes.try_into().unwrap());
             let x = word ^ 0x2020_2020_2020_2020;
@@ -116,7 +130,7 @@ fn scan<'a>(
         let x = word ^ 0x0a0a_0a0a_0a0a_0a0a;
         let newline = x.wrapping_sub(0x0101_0101_0101_0101) & !x & 0x8080_8080_8080_8080;
         let mut latency = 0u32;
-        if newline != 0 && chunk.len() >= i + 8 {
+        if newline != 0 {
             let digits = newline.trailing_zeros() as usize / 8;
             latency = digits8((word << (64 - 8 * digits)) & 0x0f0f_0f0f_0f0f_0f0f);
             i += digits;
@@ -127,7 +141,7 @@ fn scan<'a>(
             }
         }
         i += 1;
-        let mut slot = (h >> 32) as usize & (slots.len() - 1);
+        let mut slot = (h >> 32) as usize & (slots.len() - 1); // the top bits of the hash, masked to the table size
         let id = loop {
             match slots[slot] {
                 0 => {
@@ -203,18 +217,15 @@ fn scan_all<'a>(
     })
 }
 
-// Append `n` in decimal.
+// Append `n` in decimal. The buffer starts as '0's, so n = 0 prints "0" (at.min(19) keeps one digit).
 fn push_decimal(text: &mut Vec<u8>, mut n: u64) {
-    let (mut digits, mut at) = ([0; 20], 20);
-    loop {
+    let (mut digits, mut at) = ([b'0'; 20], 20);
+    while n > 0 {
         at -= 1;
         digits[at] = b'0' + (n % 10) as u8;
         n /= 10;
-        if n == 0 {
-            break;
-        }
     }
-    text.extend_from_slice(&digits[at..]);
+    text.extend_from_slice(&digits[at.min(19)..]);
 }
 
 fn main() {
@@ -224,17 +235,15 @@ fn main() {
     let input = map(&format!("{data}/requests.log"));
 
     // Cut the file after a newline into one chunk per thread; each thread scans its own chunk.
-    let threads = std::thread::available_parallelism().unwrap().get();
-    let cuts: Vec<usize> = (0..=threads)
-        .map(|i| {
+    let threads = std::thread::available_parallelism().map_or(1, |n| n.get());
+    let cuts: Vec<usize> = std::iter::once(0)
+        .chain((1..=threads).map(|i| {
             let from = input.len() * i / threads;
-            let rest = input[from..].iter().position(|&b| b == b'\n');
-            if i == 0 {
-                0
-            } else {
-                from + rest.map_or(input.len() - from, |n| n + 1)
-            }
-        })
+            from + input[from..]
+                .iter()
+                .position(|&b| b == b'\n')
+                .map_or(input.len() - from, |n| n + 1)
+        }))
         .collect();
 
     // Fast path: the spec's 72-hour window. If any timestamp is outside it, number the distinct hours
@@ -319,8 +328,8 @@ fn main() {
             .collect();
         spawned.into_iter().map(|t| t.join().unwrap()).collect()
     });
-    let mut file = File::create(format!("{out}/summary.txt")).unwrap();
+    let mut file = File::create(format!("{out}/summary.txt")).unwrap_or_else(|e| fail(&out, e));
     for piece in pieces.iter().flatten() {
-        file.write_all(piece).unwrap();
+        file.write_all(piece).unwrap_or_else(|e| fail(&out, e));
     }
 }
