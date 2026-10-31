@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fs::File;
 use std::io::Write;
 use std::os::fd::AsRawFd;
@@ -258,15 +258,16 @@ fn main() {
     });
 
     // All endpoints in output order (bytewise), and each thread's local id for each of them.
-    let mut names: Vec<&[u8]> = parts.iter().flat_map(|p| p.names.iter().copied()).collect();
+    let distinct: HashSet<&[u8]> = parts.iter().flat_map(|p| p.names.iter().copied()).collect();
+    let mut names: Vec<&[u8]> = distinct.into_iter().collect();
     names.sort_unstable();
-    names.dedup();
+    let rank_of: HashMap<&[u8], usize> = names.iter().enumerate().map(|(r, n)| (*n, r)).collect();
     let maps: Vec<Vec<Option<usize>>> = parts
         .iter()
         .map(|p| {
             let mut map = vec![None; names.len()];
             for (id, name) in p.names.iter().enumerate() {
-                map[names.binary_search(name).unwrap()] = Some(id);
+                map[rank_of[name]] = Some(id);
             }
             map
         })

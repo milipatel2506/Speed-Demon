@@ -47,6 +47,7 @@ Every step from the reference to your final version, each with the live-board ru
 | - | Failed experiment (Stage 4, PGO with build-time training in the allowlisted halloumee llvm-tools image): verified to build offline and to pass every check and the board's gates, but no measurable gain over the plain build from the same image (121 paired rounds: wall -0.9 ms, cpu -0.9 ms, better in 65/121 against 60/121 for the identical-binary control). Details, the verified Dockerfile and the rules reading are in the Stage 4 section. Not adopted; the Dockerfile and code are unchanged | | 0.09 | 30 | |
 | - | Failed experiment, board-tested (variant V1, commit 206133a, reverted): 96 small chunks and 24 three-hour render tasks claimed from shared atomic counters by min(12, cpus) workers, one set of tables per worker, merged at the end. Board result: T 0.05991 s, M 54.2 MB, S 311, K 23.83. Against the best build cec700a (T 0.05716 s, M 54.5 MB, S 292, K 24.61) it is slower by 4.8%, uses the same memory, and costs 19 more code lines, so K is lower. The 12-worker, many-chunk layout did not pay on the box. Possible causes, not measured: twelve parts make the render gather more work per group, and the 24 small render tasks read each part's counts in shorter runs than the tip's one run of hours per thread; the extra 19 lines also cost K directly. Locally (4 CPUs) it had been a wall tie and +17 ms cpu. Reverted by a new commit, no force push | | 0.0599 | 54.2 | |
 | - | Failed experiment, board-tested (variant V2, commit c9e1c18, reverted): the V1 layout with the worker cap at 6 instead of 12 (96 chunks and 24 render tasks claimed from shared counters). Board result: T 0.06784 s, M 44.6 MB, S 311, K 23.29, against the best build cec700a (T 0.05716 s, M 54.5 MB, S 292, K 24.61). Slower than both V1 and the best build; the memory is lower, but not enough to pay for the time. Reverted by a new commit, no force push | | 0.0678 | 44.6 | |
+| 30 | Serial-path step (kept): endpoint-name ranking with a HashSet and a HashMap instead of a 22k-name sort and a binary search per name and part. Ranking stage 8.28 ms to 3.78 ms with 12 workers forced; whole-run paired timing wall -1.2 and -1.3 ms (12 workers forced), -1.6 ms (4 workers). Three other candidates (exit without dropping, parallel pwrite, pre-sized output file) were tried and did not help; see the serial-path audit. Verified: three seed-1 hashes, seeds 2, 3 and 4, spec example, empty input, the three stress files at 1 and 4 CPUs, the board's run_submission.py gates, and a build with 12 workers forced. 285 to 286 code lines (+1) | | 0.057 | 54 | |
 
 Step 0 is the scoring box's calibration of the reference on seed 1. Steps 1 and later are measured on my dev machine (4 vCPU Xeon @ 2.1 GHz, warm page cache), not the scoring box, and have no board run ID yet, so replace them with the board's numbers. T is the median of 5 runs on `full`, and the same binary varies about 10% between sessions on this shared VM, so only compare rows measured back to back (seed 1) and M is the peak anonymous RSS, sampled from `/proc/<pid>/status` (RssAnon), which leaves out the file pages of the mapped input. Every row's output hash matched on tiny, sample and full. This machine has 4 CPUs, so the 12-thread step cannot show its full gain here.
 
@@ -226,6 +227,40 @@ ENTRYPOINT ["/app/solution"]
 | V2 (c9e1c18, reverted) | 6 | 96 | 0.06784 | 44.6 | 311 | 23.29 |
 
 Observation reported with the board results: going from 6 to 12 workers cut the time by only about 12% (0.06784 s to 0.05991 s), which suggests that roughly half of the wall time is serial or fixed work; and the 9.6 MB memory gap (54.2 MB to 44.6 MB) implies about 1.6 MB per worker thread. A caveat on the first inference: twelve SMT threads on six cores deliver much less than twice the compute of six threads (typically 20 to 30% more), so a 12% gain is also consistent with a mostly parallel run; an Amdahl fit through the two timings alone (T = serial + parallel / workers) would put the serial part at about 52 ms, which is an upper bound, not a measurement. The serial path is therefore timed directly in the next section instead of being inferred.
+
+### Serial-path audit with 12 workers (stamps on CLOCK_MONOTONIC in a scratchpad copy, median of 21 runs, ms)
+
+The scratch copy is forced to 12 workers on this 4-CPU VM, so the parallel stages (scan, render) and the two thread spawns are inflated by oversubscription and by the spawning thread being descheduled (their minimums are 0.2 to 1 ms); read the serial stages, not those. "Before" is the best build cec700a; "after" has the hashed ranking below.
+
+| Stage | Before | After |
+|---|---|---|
+| process start to main (fork, exec, loader, runtime) | 1.47 | 1.44 |
+| args, open and mmap of the input | 0.02 | 0.02 |
+| chunk cuts (newline search at 12 cut points) | 0.04 | 0.04 |
+| hour labels + spawn of 12 scan threads | 4.71 | 9.23 |
+| parallel scan until the last thread finishes | 62.79 | 56.84 |
+| join returns after the last thread finished | 0.08 | 0.07 |
+| collect of parts | 0.00 | 0.00 |
+| endpoint-name ranking and maps, total | 8.28 | 3.78 |
+| spawn of 12 render threads | 5.72 | 0.59 |
+| parallel render until join | 20.88 | 26.03 |
+| output file create and write | 7.31 | 6.61 |
+| drops of all buffers at the end of main | 2.36 | 2.26 |
+| process exit (teardown, until the parent sees it) | 3.28 | 3.34 |
+| TOTAL | 115.07 | 111.85 |
+
+Adding up the serial stages (start-up, open, cuts, ranking, write, drops, exit, plus the two spawns at their typical cost) gives roughly 20 to 35 ms of the 112 to 115 ms total here, not half, but it is a larger share on the box where the parallel stages are shorter; the two-timing Amdahl fit in the previous section remains an upper bound.
+
+Per-worker memory (peak anonymous, median of 9 sampled runs, with the worker count forced): 4 workers 29.6 MB, 6 workers 32.7 MB, 12 workers 43.0 MB, i.e. 1.55 MB per worker from 4 to 6 and 1.7 MB per worker from 6 to 12, matching the 1.6 MB read off the board. About 1.06 MB of that is the two per-worker count tables (`start` and `errors`, 132k `u32` each); the rest is the worker's last partial row block, its intern table and names, and its allocator arena and stack. The board's 54 MB at 12 workers is higher than this because it also charges the 10 MB output file's page cache.
+
+Candidates from the audit:
+
+- Kept: endpoint-name ranking with a `HashSet` (dedupe) and a `HashMap` (name to rank) instead of sorting all 22k names and binary-searching each of them for every part. The ranking stage goes from 8.28 ms to 3.78 ms (8.10 ms to 4.00 ms in an earlier pair of audits; minimum 7.7 ms to 3.2 ms). Whole-run paired timing is too noisy to see 4 ms: forced 12 workers, 41 rounds twice: wall -1.2 and -1.3 ms; real 4 workers: wall -1.6 ms, cpu -7.5 ms. One more line (285 to 286). Kept.
+- Failed: `std::process::exit(0)` right after the last write, to skip freeing every buffer. The drop stage (2.4 to 2.8 ms) just moves into the kernel's teardown of the address space: paired wall +0.6 and -1.3 ms (forced 12 workers, 41 rounds each) and +0.2 ms (real 4 workers), new faster in 20 to 22 of 41 rounds.
+- Failed: writing the per-hour buffers in parallel with `write_all_at` at prefix-sum offsets after `set_len`, in 12 threads. The write stage stays at about 7 ms (7.01 ms to 7.22 ms) for 16 more lines; buffered writes to one file most likely serialise in the kernel (not verified).
+- Failed: `set_len` of the whole output before the serial writes: 6.46 and 6.58 ms against 6.59 and 6.49 ms.
+- Nothing to remove: no large allocation is zero-filled by the program (the latency array comes from `calloc`, whose pages the kernel zeroes on first touch and which are counted as page faults; the count tables grow by 72 entries per new endpoint).
+- Not done: shrinking the per-worker count tables. Using `u16` would halve them but is wrong whenever one (endpoint, hour) group has more than 65,535 requests in one worker's share, and exact sizing does not help because the tables are dense (127k of the 132k slots are used).
 
 PGO: see Stage 4 above (tried with the allowlisted llvm-tools image, no measurable gain).
 
